@@ -43,6 +43,7 @@ class JobSpec:
     user_message: str
     allowed_tools: list[str]
     max_turns: int = 20
+    mcp_config_path: Path | None = None
     extra_args: list[str] = field(default_factory=list)
 
 
@@ -99,6 +100,8 @@ class ClaudeCodeProcess:
         ]
         if self.spec.allowed_tools:
             args += ["--allowedTools", ",".join(self.spec.allowed_tools)]
+        if self.spec.mcp_config_path is not None:
+            args += ["--mcp-config", str(self.spec.mcp_config_path)]
         args += self.spec.extra_args
         args.append(self.spec.user_message)
 

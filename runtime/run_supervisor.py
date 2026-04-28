@@ -5,6 +5,10 @@ The supervisor accepts `job.start` frames from the cloud, spawns a
 forwards each translated `StepEvent` upstream as a `run.<type>` frame
 the cloud's `agent_runner_device` knows how to ingest.
 
+For each run we also write a one-off MCP config file pointing CC at
+the local `xelos-mcp` server (P3) so cloud tools (delegate, council,
+fetch_data_source, memory, etc.) are reachable inside the session.
+
 Concurrency cap defends the host against runaway delegation chains
 that would otherwise spawn unbounded CC processes.
 """
@@ -12,13 +16,17 @@ that would otherwise spawn unbounded CC processes.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import shutil
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from .cc_process import ClaudeCodeProcess, ClaudeNotFound, JobSpec, StepEvent
+from .config import _xelos_home
 from .fs_mirror import org_root
 
 log = logging.getLogger(__name__)
@@ -135,6 +143,13 @@ class RunSupervisor:
             finally:
                 async with self._lock:
                     self._active.pop(run_id, None)
+                # Best-effort cleanup of the per-run MCP config so
+                # /run files don't accumulate forever.
+                if spec.mcp_config_path is not None:
+                    try:
+                        os.unlink(spec.mcp_config_path)
+                    except OSError:
+                        pass
 
     # Helpers ------------------------------------------------------------
     def _build_spec(
@@ -155,14 +170,63 @@ class RunSupervisor:
             / agent_slug
         )
         max_turns = max(1, int(agent.get("max_steps") or 20))
+        mcp_config_path = self._write_mcp_config(run_id)
+
+        # Allow the cloud-side allowlist to surface in CC by adding a
+        # name-scoped entry per Xelos tool. CC matches MCP tools via
+        # `mcp__xelos__<name>` so we forward those names verbatim.
+        cc_allowed = list(frame.get("allowed_tools") or [])
+        for slug in frame.get("xelos_tools") or []:
+            cc_allowed.append(f"mcp__xelos__{slug}")
+
         return JobSpec(
             run_id=run_id,
             working_directory=cwd,
             system_prompt=frame.get("system_prompt") or "",
             user_message=frame.get("user_message") or "",
-            allowed_tools=list(frame.get("allowed_tools") or []),
+            allowed_tools=cc_allowed,
             max_turns=max_turns,
+            mcp_config_path=mcp_config_path,
         )
+
+    def _write_mcp_config(self, run_id: str) -> Path | None:
+        """Write a one-off MCP config tying this run's CC to xelos-mcp.
+
+        We resolve the `xelos-mcp` binary at the same prefix as `xelos`
+        (the venv where this daemon runs) so a relocated install can't
+        end up shelling out to a different Python.
+        """
+        binary = shutil.which("xelos-mcp")
+        if binary is None:
+            log.warning(
+                "xelos-mcp not on PATH; agent will run with native CC tools only"
+            )
+            return None
+
+        home = _xelos_home() / "runs"
+        home.mkdir(parents=True, exist_ok=True)
+        try:
+            home.chmod(0o700)
+        except OSError:
+            pass
+
+        cfg_path = home / f"{run_id}.mcp.json"
+        cfg = {
+            "mcpServers": {
+                "xelos": {
+                    "type": "stdio",
+                    "command": binary,
+                    "args": ["--run-id", run_id],
+                    "env": {},
+                }
+            }
+        }
+        cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        try:
+            cfg_path.chmod(0o600)
+        except OSError:
+            pass
+        return cfg_path
 
     async def _send_event(self, run_id: str, ev: StepEvent) -> None:
         """Wrap a StepEvent into the cloud's run.* frame envelope."""

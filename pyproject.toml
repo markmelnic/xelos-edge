@@ -17,6 +17,7 @@ dependencies = [
     "websockets>=13.0",
     "platformdirs>=4.2",
     "watchdog>=4.0",
+    "mcp>=1.0",
 ]
 
 [project.optional-dependencies]
@@ -28,6 +29,7 @@ dev = [
 
 [project.scripts]
 xelos = "runtime.cli:main"
+xelos-mcp = "runtime.mcp_server:main"
 
 [tool.setuptools.packages.find]
 include = ["runtime*"]
