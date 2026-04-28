@@ -7,11 +7,14 @@ platform machine id is readable.
 from __future__ import annotations
 
 import hashlib
+import logging
 import platform
 import uuid
 from pathlib import Path
 
 from .config import _xelos_home
+
+log = logging.getLogger(__name__)
 
 
 def _read_machine_id() -> str | None:
@@ -46,7 +49,7 @@ def _read_machine_id() -> str | None:
                     if len(parts) >= 4:
                         return parts[-2]
         except Exception:
-            pass
+            log.debug("ioreg IOPlatformUUID lookup failed", exc_info=True)
 
     if system == "Windows":
         try:
@@ -60,7 +63,7 @@ def _read_machine_id() -> str | None:
                 if isinstance(value, str) and value.strip():
                     return value.strip()
         except Exception:
-            pass
+            log.debug("winreg MachineGuid lookup failed", exc_info=True)
         try:
             import subprocess
 
@@ -74,7 +77,7 @@ def _read_machine_id() -> str | None:
                 if v and v.lower() != "uuid":
                     return v
         except Exception:
-            pass
+            log.debug("wmic UUID lookup failed", exc_info=True)
 
     return None
 
@@ -99,3 +102,8 @@ def fingerprint() -> str:
         or "unknown"
     )
     return hashlib.sha256(f"{base}::{user}".encode("utf-8")).hexdigest()
+
+
+def short_host() -> str:
+    """Truncated hostname for filename suffixing (e.g. conflict markers)."""
+    return (platform.node() or "device").split(".")[0][:24]

@@ -25,6 +25,7 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from .capabilities import detect as detect_capabilities
 from .config import Credentials
+from .fingerprint import short_host
 from .fs_mirror import FsMirror
 from .hydrate import fetch_manifest
 from .path_resolver import resolve as resolve_path
@@ -555,7 +556,7 @@ class Daemon:
 
         if target.exists():
             stash = target.with_name(
-                f"{target.name}.{_short_host()}.conflict.{int(time.time())}"
+                f"{target.name}.{short_host()}.conflict.{int(time.time())}"
             )
             try:
                 shutil.copy2(target, stash)
@@ -618,7 +619,3 @@ def _guess_mime(path: Path) -> str:
     return _MIME_BY_SUFFIX.get(path.suffix.lower(), "application/octet-stream")
 
 
-def _short_host() -> str:
-    import platform
-
-    return (platform.node() or "device").split(".")[0][:24]

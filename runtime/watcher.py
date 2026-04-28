@@ -13,7 +13,7 @@ from typing import Awaitable, Callable
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
-from .path_resolver import resolve, should_ignore
+from .path_resolver import should_ignore
 
 log = logging.getLogger(__name__)
 

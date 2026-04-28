@@ -22,6 +22,7 @@ from typing import Any, Awaitable, Callable
 import httpx
 
 from .config import Credentials
+from .fingerprint import short_host
 from .fs_mirror import FsMirror, _resolve_target
 from .hydrate import fetch_manifest
 from .path_resolver import resolve as resolve_local_path
@@ -463,7 +464,7 @@ async def _resolve_conflict(
     path_obj = Path(abs_path)
     if path_obj.exists():
         stash = path_obj.with_name(
-            f"{path_obj.name}.{_short_host()}.conflict.{int(time.time())}"
+            f"{path_obj.name}.{short_host()}.conflict.{int(time.time())}"
         )
         try:
             shutil.copy2(path_obj, stash)
@@ -491,10 +492,6 @@ async def _resolve_conflict(
         suppress(str(outcome.abs_path))
 
 
-def _short_host() -> str:
-    import platform
-
-    return (platform.node() or "device").split(".")[0][:24]
 
 
 def _guess_mime_simple(path: Path) -> str:

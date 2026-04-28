@@ -16,6 +16,7 @@ from mcp.server.models import InitializationOptions
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
+from . import __version__
 from .config import Credentials
 
 log = logging.getLogger("xelos_mcp")
@@ -43,7 +44,7 @@ def _to_text(payload: Any) -> str:
 def build_server(*, run_id: str, creds: Credentials) -> Server:
     server: Server = Server(
         name="xelos",
-        version="0.1.0",
+        version=__version__,
         instructions=(
             "Bridge to the Xelos cloud. Tools listed here let you delegate "
             "to other agents, read shared/department files, escalate to a "
@@ -135,7 +136,7 @@ async def _run(server: Server) -> None:
             write_stream,
             InitializationOptions(
                 server_name="xelos",
-                server_version="0.1.0",
+                server_version=__version__,
                 capabilities=server.get_capabilities(
                     notification_options=NotificationOptions(),
                     experimental_capabilities={},
