@@ -1,12 +1,17 @@
 """WebSocket daemon — connects to cloud, sends heartbeats, awaits frames.
 
-P0 scope: hello + heartbeat. Frame protocol (job.start, fs.*) lands in P2.
+Frame router as of P1a:
+  hello_ack / heartbeat_ack / ready / ignored / error  — handshake
+  fs.push   — cloud→device file write (inline base64 or presigned URL)
+  fs.delete — cloud→device delete
+Frame protocol for job.* and device→cloud fs.* lands in later phases.
 Reconnect is exponential-backoff with full-jitter; capped at 60s.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import random
@@ -14,11 +19,15 @@ import signal
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
 import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from .capabilities import detect as detect_capabilities
 from .config import Credentials
+from .fs_mirror import FsMirror
+from .hydrate import fetch_manifest, hydrate
+from .state_db import StateDB
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +52,10 @@ class Daemon:
         self.options = options or DaemonOptions()
         self._stop = asyncio.Event()
         self._ws: Any = None
+        self._state = StateDB()
+        self._mirror: FsMirror | None = None
+        self._hydrate_lock = asyncio.Lock()
+        self._hydrated_once = False
 
     async def run(self) -> None:
         self._install_signal_handlers()
@@ -135,14 +148,131 @@ class Daemon:
         if self.options.log_frames:
             log.debug("recv %s", ftype)
 
-        if ftype in ("hello_ack", "heartbeat_ack", "ready", "ignored"):
+        if ftype == "ready":
+            # First server frame after hello — kick off the initial
+            # hydrate in the background so heartbeats keep flowing.
+            asyncio.create_task(self._initial_hydrate())
+            return
+        if ftype in ("hello_ack", "heartbeat_ack", "ignored"):
             return
         if ftype == "error":
             log.error("server error: %s", frame.get("error"))
             return
-        # P0 ignores unknown frames so future protocol versions degrade
-        # gracefully against old daemons.
+        if ftype == "fs.push":
+            await self._handle_fs_push(frame)
+            return
+        if ftype == "fs.delete":
+            await self._handle_fs_delete(frame)
+            return
+        # Unknown frames are tolerated so future protocol versions
+        # degrade gracefully against older daemons.
         log.debug("unknown frame type=%s — ignoring", ftype)
+
+    # FS sync -------------------------------------------------------------
+    async def _initial_hydrate(self) -> None:
+        async with self._hydrate_lock:
+            if self._hydrated_once:
+                return
+            try:
+                written, folders, errors = await hydrate(
+                    self.credentials, state=self._state
+                )
+                self._hydrated_once = True
+                log.info(
+                    "hydrate done: %d files, %d folders, %d errors",
+                    written,
+                    folders,
+                    errors,
+                )
+            except Exception:
+                log.exception("hydrate failed; will retry on next reconnect")
+
+    async def _ensure_mirror(self) -> FsMirror | None:
+        if self._mirror is not None:
+            return self._mirror
+        try:
+            manifest = await fetch_manifest(self.credentials)
+        except Exception:
+            log.exception("manifest fetch failed in mirror init")
+            return None
+        org_slug = manifest.get("organization_slug")
+        if not org_slug:
+            return None
+        self._mirror = FsMirror(org_slug=org_slug, state=self._state)
+        return self._mirror
+
+    async def _handle_fs_push(self, frame: dict[str, Any]) -> None:
+        mirror = await self._ensure_mirror()
+        if mirror is None:
+            log.warning("fs.push received before mirror ready; ignoring")
+            return
+        kind = frame.get("kind", "file")
+        scope = frame["scope"]
+        dept = frame.get("department_slug")
+        agent = frame.get("agent_slug")
+        rel = frame["path"]
+
+        if kind == "folder":
+            try:
+                mirror.make_folder(
+                    scope=scope,
+                    department_slug=dept,
+                    agent_slug=agent,
+                    rel_path=rel,
+                )
+            except Exception:
+                log.exception("fs.push folder failed: %s", rel)
+            return
+
+        # Resolve content: inline base64 or presigned URL.
+        content: bytes | None = None
+        if frame.get("content_b64"):
+            try:
+                content = base64.b64decode(frame["content_b64"])
+            except Exception:
+                log.warning("fs.push %s: invalid base64", rel)
+                return
+        elif frame.get("presigned_url"):
+            try:
+                async with httpx.AsyncClient(timeout=120) as http:
+                    resp = await http.get(frame["presigned_url"])
+                    resp.raise_for_status()
+                    content = resp.content
+            except Exception:
+                log.exception("fs.push %s: presigned download failed", rel)
+                return
+        else:
+            log.debug("fs.push %s: no content provided", rel)
+            return
+
+        try:
+            mirror.write_file(
+                scope=scope,
+                department_slug=dept,
+                agent_slug=agent,
+                rel_path=rel,
+                content=content,
+                content_hash=frame.get("content_hash"),
+                origin="cloud",
+            )
+            log.info("fs.push applied: %s", rel)
+        except Exception:
+            log.exception("fs.push apply failed: %s", rel)
+
+    async def _handle_fs_delete(self, frame: dict[str, Any]) -> None:
+        mirror = await self._ensure_mirror()
+        if mirror is None:
+            return
+        try:
+            mirror.delete(
+                scope=frame["scope"],
+                department_slug=frame.get("department_slug"),
+                agent_slug=frame.get("agent_slug"),
+                rel_path=frame["path"],
+            )
+            log.info("fs.delete applied: %s", frame["path"])
+        except Exception:
+            log.exception("fs.delete failed: %s", frame.get("path"))
 
     async def _send(self, ws: Any, frame: dict[str, Any]) -> None:
         if self.options.log_frames:

@@ -26,7 +26,7 @@ dev = [
 ]
 
 [project.scripts]
-xelos = "xelos_runtime.cli:main"
+xelos = "runtime.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["xelos_runtime*"]
+include = ["runtime*"]
