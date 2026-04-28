@@ -69,6 +69,16 @@ class _Debounced(FileSystemEventHandler):
         until = self._suppressed.get(abs_path, 0.0)
         if until > now:
             return
+        # Drop expired suppression entries opportunistically — the dict
+        # would otherwise grow unbounded over a long-lived daemon.
+        if until and until <= now:
+            self._suppressed.pop(abs_path, None)
+        # Cap the suppression dict; on overflow scrub everything that
+        # has aged out.
+        if len(self._suppressed) > 1024:
+            stale = [k for k, v in self._suppressed.items() if v <= now]
+            for k in stale:
+                self._suppressed.pop(k, None)
 
         path = Path(abs_path)
         if should_ignore(path):
