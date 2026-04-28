@@ -1,14 +1,4 @@
-"""xelos-mcp — local stdio MCP server proxying Xelos cloud tools.
-
-Spawned by Claude Code via `--mcp-config` once per agent run. Reads
-the daemon's stored credentials, then forwards every `tools/list` and
-`tools/call` MCP request to the cloud via HTTPS using the device's
-long-lived bearer token.
-
-The cloud authorises each call against the run's agent allowlist and
-dispatches it through the same `TOOL_REGISTRY` cloud agents use, so
-behaviour is identical regardless of where the LLM session is running.
-"""
+"""Stdio MCP server. CC spawns one per run; HTTPS-proxies tool calls to cloud."""
 
 from __future__ import annotations
 
@@ -32,7 +22,7 @@ log = logging.getLogger("xelos_mcp")
 
 
 def _setup_logging() -> None:
-    # Logs go to stderr — stdout is reserved for MCP JSON-RPC.
+    # stderr only — stdout is reserved for MCP JSON-RPC.
     logging.basicConfig(
         stream=sys.stderr,
         level=os.environ.get("XELOS_MCP_LOG", "INFO"),
@@ -41,12 +31,7 @@ def _setup_logging() -> None:
 
 
 def _to_text(payload: Any) -> str:
-    """Coerce a tool result into a plain-text MCP content block.
-
-    Tool handlers return arbitrary JSON-serialisable structures; CC
-    expects each block to be string content. We pretty-print structs
-    so the model gets human-readable output.
-    """
+    """Pretty-print structured tool output as MCP TextContent."""
     if isinstance(payload, str):
         return payload
     try:
@@ -56,7 +41,6 @@ def _to_text(payload: Any) -> str:
 
 
 def build_server(*, run_id: str, creds: Credentials) -> Server:
-    """Instantiate an MCP Server pre-wired to a specific run + creds."""
     server: Server = Server(
         name="xelos",
         version="0.1.0",
@@ -161,7 +145,6 @@ async def _run(server: Server) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI entry — spawned by Claude Code via `--mcp-config`."""
     _setup_logging()
 
     parser = argparse.ArgumentParser(prog="xelos-mcp")

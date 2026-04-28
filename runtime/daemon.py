@@ -1,16 +1,6 @@
-"""WebSocket daemon — connects to cloud, sends heartbeats, awaits frames.
+"""WS daemon — frame router for fs.*, run.*, job.* and friends.
 
-Frame router as of P1b:
-  hello_ack / heartbeat_ack / ready / ignored / error  — handshake
-  fs.push      — cloud→device file write (inline base64 or presigned URL)
-  fs.delete    — cloud→device delete
-  fs.ack       — cloud ack for a previous fs.write / fs.delete from us
-  fs.conflict  — cloud has diverged; stash local copy + apply cloud version
-
-Daemon emits:
-  hello / heartbeat
-  fs.write / fs.delete (after watcher debounce)
-Reconnect is exponential-backoff with full-jitter; capped at 60s.
+Reconnect: exponential backoff with full jitter, capped at 60s.
 """
 
 from __future__ import annotations
@@ -85,7 +75,6 @@ class Daemon:
         while not self._stop.is_set():
             try:
                 await self._session()
-                # Clean exit (server closed) → reset backoff and loop.
                 backoff = RECONNECT_INITIAL_SECONDS
             except asyncio.CancelledError:
                 raise
@@ -97,13 +86,11 @@ class Daemon:
             if self._stop.is_set():
                 break
 
-            # Full-jitter backoff so multiple devices don't reconnect in
-            # lockstep after a server restart.
+            # Full jitter — avoids reconnect storms after a server restart.
             sleep_for = random.uniform(0, backoff)
             log.info("reconnecting in %.1fs", sleep_for)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=sleep_for)
-                # _stop fired → exit loop.
                 break
             except asyncio.TimeoutError:
                 pass
@@ -138,7 +125,6 @@ class Daemon:
             try:
                 async for raw in ws:
                     if isinstance(raw, bytes):
-                        # Binary frames reserved for fs.chunk in P1+.
                         if self.options.log_frames:
                             log.debug("binary frame %d bytes", len(raw))
                         continue
@@ -170,8 +156,7 @@ class Daemon:
             log.debug("recv %s", ftype)
 
         if ftype == "ready":
-            # First server frame after hello — kick off reconcile in
-            # the background so heartbeats keep flowing.
+            # Reconcile runs on every connect; kick off in the background.
             asyncio.create_task(self._on_ready())
             return
         if ftype in ("hello_ack", "heartbeat_ack", "ignored"):
@@ -201,19 +186,10 @@ class Daemon:
             if self._runs is not None:
                 await self._runs.cancel(frame)
             return
-        # Unknown frames are tolerated so future protocol versions
-        # degrade gracefully against older daemons.
         log.debug("unknown frame type=%s — ignoring", ftype)
 
-    # FS sync -------------------------------------------------------------
     async def _on_ready(self) -> None:
-        """Run reconcile on every connect.
-
-        First connect: state.db empty so reconcile devolves into a
-        plain hydrate. Subsequent connects: full three-way diff
-        between cloud manifest, local state, and disk truth — picks
-        up any drift that happened while we were offline.
-        """
+        """Reconcile every connect; first run reduces to a plain hydrate."""
         async with self._hydrate_lock:
             mirror = await self._ensure_mirror()
             if mirror is None:
@@ -327,9 +303,6 @@ class Daemon:
                 content_hash=frame.get("content_hash"),
                 origin="cloud",
             )
-            # Tell the watcher to swallow events for this path that
-            # follow our own write — defense in depth on top of the
-            # state-hash echo guard.
             if self._watcher is not None:
                 self._watcher.suppress(str(outcome.abs_path))
             log.info("fs.push applied: %s", rel)
@@ -353,7 +326,6 @@ class Daemon:
         except Exception:
             log.exception("fs.delete failed: %s", frame.get("path"))
 
-    # Watcher-driven upstream --------------------------------------------
     async def _ensure_supervisor(self) -> RunSupervisor | None:
         if self._runs is not None:
             return self._runs
@@ -366,7 +338,7 @@ class Daemon:
         async def _send(frame: dict[str, Any]) -> None:
             current_ws = self._ws
             if current_ws is None:
-                # Run continues; cloud will time out the run on its end.
+                # Cloud times the run out on its side.
                 log.debug("supervisor send dropped (ws closed): %s", frame.get("type"))
                 return
             await self._send(current_ws, frame)
@@ -395,13 +367,11 @@ class Daemon:
 
         ws = self._ws
         if ws is None:
-            # Disconnected — drop the event; reconcile-on-reconnect (P1c)
-            # will pick up the diff. For P1b we accept this gap.
+            # Reconcile-on-reconnect picks up the diff.
             return
 
         if event.deleted or not event.abs_path.exists():
-            # Path-state cleared first so a fresh write doesn't think
-            # the file is still synced under the old hash.
+            # Clear state first — a follow-up write must not look synced.
             self._state.delete(str(event.abs_path))
             await self._send(
                 ws,
@@ -425,8 +395,6 @@ class Daemon:
         actual_hash = hashlib.sha256(content).hexdigest()
         prev = self._state.get(str(event.abs_path))
         if prev is not None and prev.content_hash == actual_hash:
-            # No real change — debounced flurry from our own write or a
-            # touch with no content delta.
             return
 
         parent_hash = prev.content_hash if prev is not None else None
@@ -501,7 +469,6 @@ class Daemon:
             )
         )
 
-    # Large-file upload helpers ----------------------------------------
     async def _presigned_put(
         self,
         *,
@@ -511,7 +478,6 @@ class Daemon:
         rel_path: str,
         mime_type: str,
     ) -> dict[str, Any] | None:
-        """Ask cloud to allocate an S3 key + presigned PUT URL."""
         body = {
             "scope": scope,
             "department_slug": department_slug,
@@ -565,14 +531,8 @@ class Daemon:
             log.exception("S3 PUT crashed")
             return False
 
-    # Conflict handling ---------------------------------------------------
     async def _handle_fs_conflict(self, frame: dict[str, Any]) -> None:
-        """Cloud rejected our fs.write — its hash differs from our parent.
-
-        Strategy: stash the local copy as `<name>.<host>.conflict.<ts>`
-        and re-fetch the cloud version via fs.push or manifest hydrate.
-        Last-writer-wins; humans can reconcile from the stash.
-        """
+        """Cloud diverged. Stash local copy; cloud version wins (LWW)."""
         mirror = self._mirror
         if mirror is None:
             return
@@ -605,8 +565,7 @@ class Daemon:
             except Exception:
                 log.exception("conflict stash failed: %s", rel)
 
-        # Drop our state row so the next fs.push from cloud is treated
-        # as a fresh write and overwrites the local file cleanly.
+        # Drop state so the next fs.push overwrites cleanly.
         self._state.delete(str(target))
 
     async def _send(self, ws: Any, frame: dict[str, Any]) -> None:
@@ -624,8 +583,7 @@ class Daemon:
             try:
                 loop.add_signal_handler(sig, self._stop.set)
             except NotImplementedError:
-                # Windows / non-main-thread.
-                pass
+                pass  # Windows / non-main-thread.
 
 
 def _redact_token(url: str) -> str:

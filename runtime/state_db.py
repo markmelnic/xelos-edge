@@ -1,9 +1,4 @@
-"""Local SQLite tracking for mirrored files.
-
-Survives daemon restarts so we know which paths have been hydrated and
-can detect cloud→device echoes (incoming `fs.push` matching the local
-hash → ignore).
-"""
+"""SQLite-backed per-path sync state. Survives daemon restarts."""
 
 from __future__ import annotations
 
@@ -51,7 +46,6 @@ class FileState:
 
 
 class StateDB:
-    """Thin sync wrapper. SQLite handles concurrency via WAL + RLock."""
 
     def __init__(self, path: Path | None = None) -> None:
         self._path = path or state_db_path()

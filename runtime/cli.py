@@ -1,12 +1,4 @@
-"""xelos — pair / serve / status CLI.
-
-Commands:
-  xelos pair <code> --api <url>     Redeem a pair code, write credentials.
-  xelos serve                       Run the WS daemon (foreground).
-  xelos status                      Print local credentials + capability report.
-  xelos doctor                      Sanity-check tooling (claude, node, etc.).
-  xelos logout                      Wipe credentials.
-"""
+"""xelos CLI — pair / serve / status / doctor / logout."""
 
 from __future__ import annotations
 

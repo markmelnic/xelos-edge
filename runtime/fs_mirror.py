@@ -1,11 +1,4 @@
-"""Local mirror writer.
-
-Lays files out under `~/xelos/{org_slug}/...` matching the cloud S3
-prefix. Refuses any path that escapes the org root (chroot-enforced).
-
-For P1a only cloud→device direction is wired; fsnotify upstream lands
-in P1b.
-"""
+"""Chroot-enforced local mirror writer rooted at `~/.xelos/mirror/{org}/`."""
 
 from __future__ import annotations
 
@@ -23,7 +16,6 @@ log = logging.getLogger(__name__)
 
 
 def org_root(org_slug: str) -> Path:
-    """Local mirror root for an organization."""
     return _xelos_home() / "mirror" / org_slug
 
 
@@ -35,9 +27,8 @@ def _resolve_target(
     agent_slug: str | None,
     rel_path: str,
 ) -> Path:
-    """Compute the absolute path for a file_node.
+    """Layout matches the cloud S3 prefix.
 
-    Mirrors the cloud S3 prefix shape:
         organization → {org}/_org/{rel}
         department   → {org}/departments/{dept}/{rel}
         agent        → {org}/departments/{dept}/agents/{agent}/{rel}
@@ -58,7 +49,6 @@ def _resolve_target(
 
     rel = _normalise_rel(rel_path)
     target = (prefix / rel).resolve()
-    # Chroot enforcement — refuse anything outside the org root.
     base_resolved = base.resolve()
     if not _is_within(base_resolved, target):
         raise ValueError(f"refused path escape: {target}")
@@ -94,7 +84,6 @@ class FsMirror:
         self.root = org_root(org_slug)
         self.root.mkdir(parents=True, exist_ok=True)
 
-    # File ops -------------------------------------------------------------
     def write_file(
         self,
         *,
@@ -115,14 +104,13 @@ class FsMirror:
         )
 
         actual_hash = content_hash or hashlib.sha256(content).hexdigest()
-        # Echo guard — incoming push matches what's already on disk.
+        # Echo: incoming hash already matches local.
         prev = self.state.get(str(target))
         if prev is not None and prev.content_hash == actual_hash:
             return WriteOutcome(abs_path=target, skipped_echo=True)
 
         target.parent.mkdir(parents=True, exist_ok=True)
-        # Atomic-ish write: tmp + rename so a crash mid-write doesn't
-        # leave a half-written file matching the wrong hash.
+        # tmp + atomic rename so a crash can't leave a half-written file.
         tmp = target.with_suffix(target.suffix + ".xelos-tmp")
         with tmp.open("wb") as f:
             f.write(content)
@@ -181,8 +169,7 @@ class FsMirror:
             rel_path=rel_path,
         )
         if target.is_dir():
-            # Only delete an empty dir; remaining children belong to
-            # other still-live nodes that haven't been deleted yet.
+            # Only empty dirs — children may still be live nodes.
             try:
                 target.rmdir()
             except OSError:

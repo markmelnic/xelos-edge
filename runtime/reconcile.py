@@ -1,25 +1,10 @@
-"""Bidirectional drift reconciliation against the cloud.
+"""Three-way reconcile (manifest vs state.db vs disk) on each connect.
 
-Runs on every successful connect. Compares three sources of truth:
+Outcomes per path: in_sync / pull_cloud / push_local / push_local_new /
+push_delete / pull_delete / conflict (cloud wins, local stashed).
 
-  * cloud manifest (`GET /devices/me/fs/manifest`)
-  * local state DB (what we believed was synced last time)
-  * local mirror tree on disk (what is actually present right now)
-
-For each path the diff falls into one of:
-
-  in_sync           hash matches everywhere → no-op
-  pull_cloud        cloud has newer content → download + write locally
-  push_local        local has newer content → emit fs.write upstream
-  push_local_new    local-only file the cloud has never seen → fs.write
-  push_delete       local file gone, cloud still has it → fs.delete upstream
-  pull_delete       cloud deleted while we held it → unlink locally
-  conflict          both sides diverged → cloud wins, local stashed
-
-The "synced hash" used for the three-way comparison is `state.content_hash`
-since both `fs_mirror.write_file` (cloud→device) and the daemon's
-`_on_local_change` (device→cloud, post-send) keep it equal to whatever
-we last successfully synced in either direction.
+`state.content_hash` doubles as the synced-state hash both directions —
+both fs.push apply and post-send local→cloud keep it current.
 """
 
 from __future__ import annotations
@@ -87,8 +72,7 @@ async def reconcile_with_cloud(
     """Reconcile the local mirror with the cloud manifest.
 
     `send` emits a frame upstream over the daemon's WS. `suppress` is
-    invoked with each absolute path we write locally so the watcher
-    skips the resulting fsnotify event (echo prevention).
+    invoked per locally-written path so the watcher skips the echo.
     """
     summary = ReconcileSummary()
     try:
@@ -107,7 +91,6 @@ async def reconcile_with_cloud(
         summary.errors += 1
         return summary
 
-    # Index manifest file entries by their resolved absolute path.
     manifest_by_path: dict[str, dict[str, Any]] = {}
     folders: list[dict[str, Any]] = []
     for entry in manifest.get("entries", []):
@@ -130,7 +113,7 @@ async def reconcile_with_cloud(
             continue
         manifest_by_path[str(target)] = entry
 
-    # Folders first so file writes don't race their parents.
+    # Folders first — file writes can't race their parents.
     for entry in folders:
         try:
             mirror.make_folder(
@@ -142,7 +125,6 @@ async def reconcile_with_cloud(
         except Exception:
             log.warning("folder reconcile skipped: %s", entry.get("path"))
 
-    # Pass 1: every path the daemon thinks it knows about.
     pulls: list[dict[str, Any]] = []
     pushes_existing: list[tuple[str, FileState | None]] = []
     pushes_new: list[str] = []
@@ -161,7 +143,6 @@ async def reconcile_with_cloud(
 
         if not local_exists:
             if cloud_entry is not None:
-                # Local file deleted while offline; tell cloud.
                 summary.deleted_remote += 1
                 resolved = resolve_local_path(
                     root=mirror.root, abs_path=path_obj
@@ -182,7 +163,7 @@ async def reconcile_with_cloud(
                 state.delete(abs_path)
                 summary.actions.append(f"push_delete {abs_path}")
             else:
-                # Both gone — clean up the stale state row.
+                # Both gone — drop the stale state row.
                 state.delete(abs_path)
                 summary.skipped += 1
             continue
@@ -196,13 +177,11 @@ async def reconcile_with_cloud(
         synced_hash = prev.content_hash if prev else None
 
         if cloud_entry is None:
-            # Cloud says this path is gone.
             if synced_hash == local_hash:
-                # Local untouched → cloud delete authoritative.
+                # Cloud delete wins — local was untouched since last sync.
                 deletes_local.append(abs_path)
             else:
-                # Local was edited after the last sync; preserve it by
-                # pushing upstream as a re-create.
+                # Local edited after sync — re-create on cloud.
                 pushes_existing.append((abs_path, prev))
             continue
 
@@ -222,16 +201,12 @@ async def reconcile_with_cloud(
             continue
 
         if synced_hash == cloud_hash and synced_hash != local_hash:
-            # Local-only change since last sync → push.
             pushes_existing.append((abs_path, prev))
         elif synced_hash == local_hash and synced_hash != cloud_hash:
-            # Cloud-only change → pull.
             pulls.append(cloud_entry)
         else:
-            # Both diverged → conflict; cloud wins, local gets stashed.
             conflicts.append((abs_path, cloud_entry, local_hash))
 
-    # Pass 2: manifest entries we had no state for.
     for abs_path, cloud_entry in manifest_by_path.items():
         path_obj = Path(abs_path)
         if path_obj.exists() and path_obj.is_file():
@@ -241,7 +216,6 @@ async def reconcile_with_cloud(
                 summary.errors += 1
                 continue
             if local_hash == cloud_entry.get("content_hash"):
-                # Already matches — just register state.
                 _record_state(
                     state,
                     abs_path,
@@ -252,12 +226,10 @@ async def reconcile_with_cloud(
                 )
                 summary.in_sync += 1
                 continue
-            # Local diverged from a cloud file we'd never tracked.
             conflicts.append((abs_path, cloud_entry, local_hash))
         else:
             pulls.append(cloud_entry)
 
-    # Pass 3: locally-created files the cloud has never heard about.
     for f in _walk_mirror_files(mirror.root):
         s = str(f)
         if s in walked:
@@ -265,15 +237,12 @@ async def reconcile_with_cloud(
         if state.get(s) is not None:
             continue
         if s in manifest_by_path:
-            # Already handled above when dealing with manifest entries
-            # without state — exhaustive but cheap.
             continue
         resolved = resolve_local_path(root=mirror.root, abs_path=f)
         if resolved is None:
             continue
         pushes_new.append(s)
 
-    # ----- Apply pulls (concurrent) ------------------------------------
     if pulls:
         async with httpx.AsyncClient(timeout=120) as http:
             sem = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
@@ -317,7 +286,6 @@ async def reconcile_with_cloud(
                 else:
                     summary.errors += 1
 
-    # ----- Apply local deletes (cloud removed while offline) ------------
     for abs_path in deletes_local:
         try:
             resolved = resolve_local_path(
@@ -340,7 +308,6 @@ async def reconcile_with_cloud(
             log.exception("local delete failed: %s", abs_path)
             summary.errors += 1
 
-    # ----- Apply pushes (existing + brand-new local files) -------------
     for abs_path, prev in pushes_existing:
         try:
             await _push_file(
@@ -371,7 +338,6 @@ async def reconcile_with_cloud(
             log.exception("push new failed: %s", abs_path)
             summary.errors += 1
 
-    # ----- Conflicts: stash local, write cloud version ----------------
     for abs_path, cloud_entry, _local_hash in conflicts:
         try:
             await _resolve_conflict(
@@ -400,9 +366,6 @@ async def reconcile_with_cloud(
         summary.in_sync,
     )
     return summary
-
-
-# Helpers --------------------------------------------------------------------
 
 
 def _walk_mirror_files(root: Path):

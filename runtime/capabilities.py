@@ -21,7 +21,7 @@ def _claude_code_version() -> str | None:
             stderr=subprocess.DEVNULL,
             timeout=5,
         ).decode().strip()
-        # `claude --version` prints e.g. "1.0.49 (Claude Code)".
+        # Output looks like "1.0.49 (Claude Code)".
         return out.split()[0] if out else None
     except Exception:
         return None

@@ -1,9 +1,4 @@
-"""Thin HTTP client against the Xelos cloud API.
-
-The daemon only hits one endpoint pre-pair (`POST /devices/pair`) and
-then stays on the WebSocket. Any other REST calls go through here so
-auth handling lives in one place.
-"""
+"""HTTP client used pre-pair (the daemon stays on the WS otherwise)."""
 
 from __future__ import annotations
 

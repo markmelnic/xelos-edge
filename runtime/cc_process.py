@@ -1,19 +1,4 @@
-"""Claude Code subprocess wrapper.
-
-Spawns `claude --print --output-format stream-json` non-interactively
-and parses each line into typed events. The wrapper is intentionally
-thin: it knows how to start, parse, and stop a CC session, and it
-maps CC's stream-json shape into Xelos `StepEvent` shapes that the
-cloud runner already understands.
-
-Stream-json line shapes (from Anthropic's public docs):
-
-    {"type":"system","subtype":"init","cwd":"...","tools":[...],"session_id":"..."}
-    {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
-    {"type":"assistant","message":{"content":[{"type":"tool_use","id":"...","name":"Read","input":{...}}]}}
-    {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"...","content":"..."}]}}
-    {"type":"result","subtype":"success","total_cost_usd":0.012,"usage":{"input_tokens":1234,"output_tokens":456}}
-"""
+"""Spawn `claude --output-format stream-json`, translate to Xelos StepEvents."""
 
 from __future__ import annotations
 
@@ -52,7 +37,7 @@ class ClaudeNotFound(Exception):
 
 
 class ClaudeCodeProcess:
-    """Owns one `claude` subprocess for the lifetime of a single run."""
+    """One `claude` subprocess per Run."""
 
     def __init__(self, spec: JobSpec) -> None:
         self.spec = spec
@@ -73,14 +58,8 @@ class ClaudeCodeProcess:
     def final_cost(self) -> float | None:
         return self._final_cost
 
-    # Lifecycle -----------------------------------------------------------
     async def stream(self) -> AsyncIterator[StepEvent]:
-        """Spawn CC and yield translated step events.
-
-        On the final `result` event the process is allowed to exit; the
-        caller is responsible for wrapping the result in a terminal
-        `agent_done` / `failed` frame and notifying the cloud.
-        """
+        """Spawn + yield translated events. Caller wraps terminal frame."""
         binary = shutil.which("claude")
         if binary is None:
             raise ClaudeNotFound(
@@ -123,8 +102,7 @@ class ClaudeCodeProcess:
             stderr=asyncio.subprocess.PIPE,
         )
 
-        # Drain stderr in the background so a noisy CC process can't
-        # deadlock by filling the pipe buffer while we wait on stdout.
+        # Drain stderr concurrently — a full pipe buffer would deadlock stdout.
         stderr_task = asyncio.create_task(self._drain_stderr())
 
         assert self._proc.stdout is not None
@@ -172,7 +150,6 @@ class ClaudeCodeProcess:
             if text:
                 log.debug("claude stderr: %s", text)
 
-    # CC stream-json → Xelos StepEvent translator -------------------------
     async def _translate(
         self, event: dict[str, Any]
     ) -> AsyncIterator[StepEvent]:
@@ -262,6 +239,5 @@ class ClaudeCodeProcess:
                 )
             return
 
-        # Unknown CC events are forwarded verbatim under a debug type so
-        # nothing is silently dropped while we iterate on the parser.
+        # Forward unknown events verbatim — nothing silently dropped.
         yield StepEvent(type="cc_raw", data={"event": event})

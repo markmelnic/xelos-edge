@@ -1,8 +1,7 @@
-"""Stable per-install fingerprint.
+"""SHA256 of (machine-id ∥ user). Distinct per user on shared hardware.
 
-Hash of (machine-id ∥ user) so multiple users on one box still get
-distinct fingerprints. Falls back to a generated UUID stored at
-`~/.xelos/fingerprint` when no platform machine id is readable.
+Falls back to a persistent UUID at `~/.xelos/fingerprint` when no
+platform machine id is readable.
 """
 
 from __future__ import annotations
@@ -18,7 +17,6 @@ from .config import _xelos_home
 def _read_machine_id() -> str | None:
     system = platform.system()
 
-    # Linux / BSD — systemd or dbus machine-id.
     if system in ("Linux", "FreeBSD", "OpenBSD", "NetBSD"):
         candidates = (
             Path("/etc/machine-id"),
@@ -33,7 +31,6 @@ def _read_machine_id() -> str | None:
             except OSError:
                 continue
 
-    # macOS — IOPlatformUUID via ioreg.
     if system == "Darwin":
         try:
             import subprocess
@@ -51,8 +48,6 @@ def _read_machine_id() -> str | None:
         except Exception:
             pass
 
-    # Windows — MachineGuid from registry (preferred), fall back to
-    # `wmic csproduct get UUID` if the registry read fails.
     if system == "Windows":
         try:
             import winreg  # type: ignore[import-not-found]

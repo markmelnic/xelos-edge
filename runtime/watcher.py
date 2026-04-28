@@ -1,14 +1,4 @@
-"""Filesystem watcher — coalesces local changes and emits sync events.
-
-Built on `watchdog` so it works on Linux (inotify), macOS (FSEvents),
-and Windows (ReadDirectoryChangesW) without per-OS branching.
-
-Events are debounced per absolute path so a sequence of
-write-write-rename collapses into one sync event after a brief quiet
-period. The handler is intentionally framework-agnostic: it calls a
-callback the daemon owns, which decides whether to push, ignore (echo
-of a cloud-originated write), or stash a conflict.
-"""
+"""watchdog-backed FS watcher with per-path debounce + echo suppression."""
 
 from __future__ import annotations
 
@@ -27,13 +17,9 @@ from .path_resolver import resolve, should_ignore
 
 log = logging.getLogger(__name__)
 
-# Quiet window after the last event for a path before we treat it as
-# settled. Most editors save in a write-write-fsync flurry that lasts
-# tens of milliseconds; 1s is generous and still feels live.
+# 1s settles editor save flurries (write-write-fsync) without feeling laggy.
 DEBOUNCE_SECONDS = 1.0
-# Suppression window for paths we just wrote ourselves (cloud → device
-# echoes). Watchdog fires on our own writes; the hash check in the
-# daemon also catches these but a path-level filter is cheaper.
+# Window for ignoring events triggered by our own cloud→device writes.
 ECHO_SUPPRESS_SECONDS = 5.0
 
 
@@ -63,18 +49,13 @@ class _Debounced(FileSystemEventHandler):
         self._suppressed = suppressed
 
     def _enqueue(self, abs_path: str, *, deleted: bool) -> None:
-        # Echo-suppression: ignore events for paths we wrote ourselves
-        # within the last few seconds.
         now = time.monotonic()
         until = self._suppressed.get(abs_path, 0.0)
         if until > now:
             return
-        # Drop expired suppression entries opportunistically — the dict
-        # would otherwise grow unbounded over a long-lived daemon.
         if until and until <= now:
             self._suppressed.pop(abs_path, None)
-        # Cap the suppression dict; on overflow scrub everything that
-        # has aged out.
+        # Bound the suppression dict on long-lived daemons.
         if len(self._suppressed) > 1024:
             stale = [k for k, v in self._suppressed.items() if v <= now]
             for k in stale:
@@ -102,12 +83,9 @@ class _Debounced(FileSystemEventHandler):
     def _fire(self, abs_path: str, deleted: bool) -> None:
         with self._lock:
             self._pending.pop(abs_path, None)
-        # call_later runs on the loop thread, so we can schedule a
-        # coroutine directly.
         ev = FsEvent(abs_path=Path(abs_path), deleted=deleted)
         asyncio.create_task(self._on_event(ev))
 
-    # watchdog event hooks ------------------------------------------------
     def on_created(self, event: FileSystemEvent) -> None:
         if event.is_directory:
             return
@@ -124,8 +102,7 @@ class _Debounced(FileSystemEventHandler):
         self._enqueue(event.src_path, deleted=True)
 
     def on_moved(self, event: FileSystemEvent) -> None:
-        # Treat move as delete(src) + write(dest); watchdog provides
-        # both a `dest_path` and the original `src_path`.
+        # Move = delete(src) + write(dest).
         if not event.is_directory:
             self._enqueue(event.src_path, deleted=True)
             dest = getattr(event, "dest_path", None)

@@ -1,17 +1,4 @@
-"""Run supervisor — drives one Claude Code subprocess per agent run.
-
-The supervisor accepts `job.start` frames from the cloud, spawns a
-`ClaudeCodeProcess` rooted in the agent's mirror directory, and
-forwards each translated `StepEvent` upstream as a `run.<type>` frame
-the cloud's `agent_runner_device` knows how to ingest.
-
-For each run we also write a one-off MCP config file pointing CC at
-the local `xelos-mcp` server (P3) so cloud tools (delegate, council,
-fetch_data_source, memory, etc.) are reachable inside the session.
-
-Concurrency cap defends the host against runaway delegation chains
-that would otherwise spawn unbounded CC processes.
-"""
+"""Drive one Claude Code subprocess per agent run; bridges cloud tools via MCP."""
 
 from __future__ import annotations
 
@@ -47,7 +34,6 @@ class RunSupervisor:
         self._active: dict[str, ClaudeCodeProcess] = {}
         self._lock = asyncio.Lock()
 
-    # Frame entry points -------------------------------------------------
     async def start(self, frame: dict[str, Any]) -> None:
         run_id = str(frame.get("run_id") or "")
         if not run_id:
@@ -74,7 +60,6 @@ class RunSupervisor:
             except Exception:  # pragma: no cover
                 log.exception("cancel_all failed for one proc")
 
-    # Run lifecycle ------------------------------------------------------
     async def _drive_run(self, run_id: str, frame: dict[str, Any]) -> None:
         async with self._sem:
             spec = self._build_spec(run_id, frame)
@@ -104,8 +89,7 @@ class RunSupervisor:
             try:
                 async for ev in proc.stream():
                     await self._send_event(run_id, ev)
-                # Stream ended cleanly. If proc never emitted `agent_done`,
-                # synthesise a terminal so the cloud doesn't wait forever.
+                # Synthesise a terminal frame if proc never emitted one.
                 exit_code = (
                     proc._proc.returncode  # noqa: SLF001
                     if proc._proc is not None
@@ -143,15 +127,12 @@ class RunSupervisor:
             finally:
                 async with self._lock:
                     self._active.pop(run_id, None)
-                # Best-effort cleanup of the per-run MCP config so
-                # /run files don't accumulate forever.
                 if spec.mcp_config_path is not None:
                     try:
                         os.unlink(spec.mcp_config_path)
                     except OSError:
                         pass
 
-    # Helpers ------------------------------------------------------------
     def _build_spec(
         self, run_id: str, frame: dict[str, Any]
     ) -> JobSpec | None:
@@ -172,9 +153,7 @@ class RunSupervisor:
         max_turns = max(1, int(agent.get("max_steps") or 20))
         mcp_config_path = self._write_mcp_config(run_id)
 
-        # Allow the cloud-side allowlist to surface in CC by adding a
-        # name-scoped entry per Xelos tool. CC matches MCP tools via
-        # `mcp__xelos__<name>` so we forward those names verbatim.
+        # CC matches MCP tools via `mcp__<server>__<tool>`.
         cc_allowed = list(frame.get("allowed_tools") or [])
         for slug in frame.get("xelos_tools") or []:
             cc_allowed.append(f"mcp__xelos__{slug}")
@@ -190,12 +169,7 @@ class RunSupervisor:
         )
 
     def _write_mcp_config(self, run_id: str) -> Path | None:
-        """Write a one-off MCP config tying this run's CC to xelos-mcp.
-
-        We resolve the `xelos-mcp` binary at the same prefix as `xelos`
-        (the venv where this daemon runs) so a relocated install can't
-        end up shelling out to a different Python.
-        """
+        """One-off `~/.xelos/runs/<id>.mcp.json` pointing CC at xelos-mcp."""
         binary = shutil.which("xelos-mcp")
         if binary is None:
             log.warning(
@@ -229,7 +203,7 @@ class RunSupervisor:
         return cfg_path
 
     async def _send_event(self, run_id: str, ev: StepEvent) -> None:
-        """Wrap a StepEvent into the cloud's run.* frame envelope."""
+        """Wrap StepEvent in the run.* frame envelope."""
         await self._send(
             {
                 "type": f"run.{ev.type}" if not ev.type.startswith("run.") else ev.type,
