@@ -39,6 +39,7 @@ from .fs_mirror import FsMirror
 from .hydrate import fetch_manifest
 from .path_resolver import resolve as resolve_path
 from .reconcile import reconcile_with_cloud
+from .run_supervisor import RunSupervisor
 from .state_db import FileState, StateDB
 from .watcher import FsEvent, FsWatcher
 
@@ -68,6 +69,7 @@ class Daemon:
         self._state = StateDB()
         self._mirror: FsMirror | None = None
         self._watcher: FsWatcher | None = None
+        self._runs: RunSupervisor | None = None
         self._hydrate_lock = asyncio.Lock()
         self._hydrated_once = False
 
@@ -184,6 +186,15 @@ class Daemon:
             return
         if ftype == "fs.conflict":
             await self._handle_fs_conflict(frame)
+            return
+        if ftype == "job.start":
+            supervisor = await self._ensure_supervisor()
+            if supervisor is not None:
+                await supervisor.start(frame)
+            return
+        if ftype == "job.cancel":
+            if self._runs is not None:
+                await self._runs.cancel(frame)
             return
         # Unknown frames are tolerated so future protocol versions
         # degrade gracefully against older daemons.
@@ -338,6 +349,26 @@ class Daemon:
             log.exception("fs.delete failed: %s", frame.get("path"))
 
     # Watcher-driven upstream --------------------------------------------
+    async def _ensure_supervisor(self) -> RunSupervisor | None:
+        if self._runs is not None:
+            return self._runs
+        ws = self._ws
+        if ws is None:
+            return None
+        caps = detect_capabilities()
+        cap = max(1, int(caps.get("max_concurrent_runs") or 4))
+
+        async def _send(frame: dict[str, Any]) -> None:
+            current_ws = self._ws
+            if current_ws is None:
+                # Run continues; cloud will time out the run on its end.
+                log.debug("supervisor send dropped (ws closed): %s", frame.get("type"))
+                return
+            await self._send(current_ws, frame)
+
+        self._runs = RunSupervisor(send=_send, max_concurrent_runs=cap)
+        return self._runs
+
     async def _ensure_watcher(self) -> None:
         if self._watcher is not None:
             return
