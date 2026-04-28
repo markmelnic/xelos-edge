@@ -347,6 +347,7 @@ async def reconcile_with_cloud(
                 mirror=mirror,
                 state=state,
                 suppress=suppress,
+                send=send,
             )
             summary.conflicts += 1
             summary.actions.append(f"conflict {abs_path}")
@@ -457,19 +458,26 @@ async def _resolve_conflict(
     mirror: FsMirror,
     state: StateDB,
     suppress: Callable[[str], None] | None,
+    send: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> None:
-    """Cloud version wins. Stash local copy then download cloud bytes."""
+    """Cloud version wins. Stash local copy then download cloud bytes.
+
+    When `send` is provided we also notify the cloud with an
+    `fs.conflict_stashed` frame so the user can see in audit / UI that a
+    local edit was stashed (instead of silently overwritten)."""
     import shutil
 
     path_obj = Path(abs_path)
+    stash_path: Path | None = None
     if path_obj.exists():
-        stash = path_obj.with_name(
+        stash_path = path_obj.with_name(
             f"{path_obj.name}.{short_host()}.conflict.{int(time.time())}"
         )
         try:
-            shutil.copy2(path_obj, stash)
+            shutil.copy2(path_obj, stash_path)
         except Exception:
             log.warning("conflict stash failed: %s", abs_path)
+            stash_path = None
 
     url = cloud_entry.get("presigned_url")
     if not url:
@@ -490,6 +498,22 @@ async def _resolve_conflict(
     )
     if suppress is not None:
         suppress(str(outcome.abs_path))
+
+    if send is not None:
+        try:
+            await send(
+                {
+                    "type": "fs.conflict_stashed",
+                    "scope": cloud_entry["scope"],
+                    "department_slug": cloud_entry.get("department_slug"),
+                    "agent_slug": cloud_entry.get("agent_slug"),
+                    "path": cloud_entry["path"],
+                    "stash_path": str(stash_path) if stash_path else None,
+                    "ts": int(time.time()),
+                }
+            )
+        except Exception:
+            log.warning("fs.conflict_stashed notify failed", exc_info=True)
 
 
 

@@ -36,7 +36,7 @@ from .watcher import FsEvent, FsWatcher
 
 log = logging.getLogger(__name__)
 
-HEARTBEAT_INTERVAL_SECONDS = 30
+HEARTBEAT_INTERVAL_SECONDS = 10
 RECONNECT_INITIAL_SECONDS = 1.0
 RECONNECT_MAX_SECONDS = 60.0
 
