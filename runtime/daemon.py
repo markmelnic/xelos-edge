@@ -36,8 +36,9 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus
 from .capabilities import detect as detect_capabilities
 from .config import Credentials
 from .fs_mirror import FsMirror
-from .hydrate import fetch_manifest, hydrate
+from .hydrate import fetch_manifest
 from .path_resolver import resolve as resolve_path
+from .reconcile import reconcile_with_cloud
 from .state_db import FileState, StateDB
 from .watcher import FsEvent, FsWatcher
 
@@ -162,9 +163,9 @@ class Daemon:
             log.debug("recv %s", ftype)
 
         if ftype == "ready":
-            # First server frame after hello — kick off the initial
-            # hydrate in the background so heartbeats keep flowing.
-            asyncio.create_task(self._initial_hydrate())
+            # First server frame after hello — kick off reconcile in
+            # the background so heartbeats keep flowing.
+            asyncio.create_task(self._on_ready())
             return
         if ftype in ("hello_ack", "heartbeat_ack", "ignored"):
             return
@@ -189,28 +190,58 @@ class Daemon:
         log.debug("unknown frame type=%s — ignoring", ftype)
 
     # FS sync -------------------------------------------------------------
-    async def _initial_hydrate(self) -> None:
+    async def _on_ready(self) -> None:
+        """Run reconcile on every connect.
+
+        First connect: state.db empty so reconcile devolves into a
+        plain hydrate. Subsequent connects: full three-way diff
+        between cloud manifest, local state, and disk truth — picks
+        up any drift that happened while we were offline.
+        """
         async with self._hydrate_lock:
-            if self._hydrated_once:
-                # Already hydrated this process — start the watcher if
-                # not already running (it survives reconnects).
-                await self._ensure_watcher()
+            mirror = await self._ensure_mirror()
+            if mirror is None:
+                log.warning("reconcile: mirror init failed; skipping")
                 return
+
+            ws = self._ws
+            if ws is None:
+                log.warning("reconcile: ws gone before run; skipping")
+                return
+
+            async def _send_via_ws(frame: dict[str, Any]) -> None:
+                await self._send(ws, frame)
+
+            def _suppress(path: str) -> None:
+                if self._watcher is not None:
+                    self._watcher.suppress(path)
+
             try:
-                written, folders, errors = await hydrate(
-                    self.credentials, state=self._state
+                summary = await reconcile_with_cloud(
+                    credentials=self.credentials,
+                    mirror=mirror,
+                    state=self._state,
+                    send=_send_via_ws,
+                    suppress=_suppress,
                 )
                 self._hydrated_once = True
                 log.info(
-                    "hydrate done: %d files, %d folders, %d errors",
-                    written,
-                    folders,
-                    errors,
+                    "reconcile complete: pulled=%d pushed=%d "
+                    "deleted_local=%d deleted_remote=%d "
+                    "conflicts=%d errors=%d in_sync=%d",
+                    summary.pulled,
+                    summary.pushed + summary.pushed_new,
+                    summary.deleted_local,
+                    summary.deleted_remote,
+                    summary.conflicts,
+                    summary.errors,
+                    summary.in_sync,
                 )
             except Exception:
-                log.exception("hydrate failed; will retry on next reconnect")
+                log.exception("reconcile failed")
                 return
-            await self._ensure_watcher()
+
+        await self._ensure_watcher()
 
     async def _ensure_mirror(self) -> FsMirror | None:
         if self._mirror is not None:
