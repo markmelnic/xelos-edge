@@ -24,6 +24,10 @@ def state_db_path() -> Path:
     return _xelos_home() / "state.db"
 
 
+def update_check_path() -> Path:
+    return _xelos_home() / "update-check.json"
+
+
 @dataclass(slots=True)
 class Credentials:
     api_base: str

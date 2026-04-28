@@ -5,7 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import shutil
+import subprocess
 import sys
+import sysconfig
+from pathlib import Path
 
 import click
 
@@ -15,6 +20,7 @@ from .capabilities import detect as detect_capabilities
 from .config import Credentials, credentials_path
 from .daemon import Daemon, DaemonOptions
 from .fingerprint import fingerprint as host_fingerprint
+from .updates import maybe_warn_outdated, refresh_cache as refresh_update_cache
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -33,6 +39,8 @@ def main(ctx: click.Context, verbose: bool) -> None:
     ctx.ensure_object(dict)
     ctx.obj["verbose"] = verbose
     _setup_logging(verbose)
+    if ctx.invoked_subcommand != "update":
+        maybe_warn_outdated(click.echo)
 
 
 @main.command("pair")
@@ -156,6 +164,101 @@ def doctor_cmd() -> None:
             click.echo(line, err=True)
         sys.exit(1)
     click.echo("\nAll checks passed.")
+
+
+@main.command("update")
+@click.option(
+    "--ref",
+    default=None,
+    help="Git ref (branch/tag/sha) to install. Defaults to main, or "
+    "$XELOS_PACKAGE_SPEC if set.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Print the upgrade command without running it.",
+)
+def update_cmd(ref: str | None, dry_run: bool) -> None:
+    """Upgrade xelos-edge in place to the latest release."""
+    install = _detect_install()
+    click.echo(f"Current xelos {__version__} ({install['kind']} @ {install['location']})")
+
+    if install["kind"] == "editable":
+        click.echo(
+            "Editable install detected. Update with:\n"
+            f"  git -C {install['location']} pull\n"
+            f"  {sys.executable} -m pip install -e \"{install['location']}[dev]\"",
+            err=True,
+        )
+        sys.exit(2)
+
+    if os.name == "nt":
+        click.echo(
+            "Windows in-place upgrade is unsafe (xelos.exe is locked while running).\n"
+            "Re-run the installer instead:\n"
+            "  iwr -useb https://raw.githubusercontent.com/markmelnic/xelos-edge/main/install.ps1 | iex",
+            err=True,
+        )
+        sys.exit(2)
+
+    spec = os.environ.get("XELOS_PACKAGE_SPEC")
+    if ref:
+        spec = f"git+https://github.com/markmelnic/xelos-edge.git@{ref}"
+    if not spec:
+        spec = "git+https://github.com/markmelnic/xelos-edge.git@main"
+
+    if spec.startswith("git+") and shutil.which("git") is None:
+        click.echo(
+            "git not found on PATH. Either install git, or set $XELOS_PACKAGE_SPEC\n"
+            "to a tarball URL, e.g.:\n"
+            "  export XELOS_PACKAGE_SPEC="
+            "https://github.com/markmelnic/xelos-edge/archive/refs/heads/main.tar.gz",
+            err=True,
+        )
+        sys.exit(2)
+
+    purelib = sysconfig.get_path("purelib")
+    if purelib and not os.access(purelib, os.W_OK):
+        click.echo(
+            f"! site-packages is not writable: {purelib}\n"
+            "  Likely a system-wide install. Try one of:\n"
+            "    - re-run the installer (recommended): "
+            "curl -fsSL https://raw.githubusercontent.com/markmelnic/xelos-edge/main/install.sh | sh\n"
+            "    - sudo xelos update\n"
+            "    - pip install --user --upgrade ...  (may not match your launcher)",
+            err=True,
+        )
+
+    cmd = [sys.executable, "-m", "pip", "install", "--upgrade", spec]
+    click.echo(f"$ {' '.join(cmd)}")
+    if dry_run:
+        return
+
+    try:
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError as exc:
+        click.echo(f"Upgrade failed (exit {exc.returncode}).", err=True)
+        sys.exit(exc.returncode)
+    refresh_update_cache()
+    click.echo("Upgrade complete. Re-run `xelos --version` to confirm.")
+
+
+def _detect_install() -> dict[str, str]:
+    """Best-effort classify how the package was installed."""
+    pkg_root = Path(__file__).resolve().parent
+    repo_root = pkg_root.parent
+    if (repo_root / "pyproject.toml").exists() and (repo_root / ".git").exists():
+        return {"kind": "editable", "location": str(repo_root)}
+    try:
+        from importlib.metadata import distribution
+
+        dist = distribution("xelos-edge")
+        direct_url = dist.read_text("direct_url.json")
+        if direct_url and '"editable": true' in direct_url:
+            return {"kind": "editable", "location": str(repo_root)}
+    except Exception:
+        pass
+    return {"kind": "installed", "location": str(pkg_root)}
 
 
 @main.command("logout")
