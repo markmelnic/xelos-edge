@@ -49,6 +49,11 @@ HEARTBEAT_INTERVAL_SECONDS = 30
 RECONNECT_INITIAL_SECONDS = 1.0
 RECONNECT_MAX_SECONDS = 60.0
 
+# Files larger than this take the presigned-PUT path so we don't blow
+# WS frame budgets. The cloud's `INLINE_PUSH_BYTES_MAX` is the same
+# threshold for the cloud→device direction.
+INLINE_PUSH_BYTES_MAX = 768 * 1024
+
 
 @dataclass(slots=True)
 class DaemonOptions:
@@ -425,10 +430,13 @@ class Daemon:
             return
 
         parent_hash = prev.content_hash if prev is not None else None
+        mime_type = _guess_mime(event.abs_path)
+
+        # Pick transport: inline base64 stays under WS frame budgets,
+        # large files PUT to S3 directly via a presigned URL.
         try:
-            await self._send(
-                ws,
-                {
+            if len(content) <= INLINE_PUSH_BYTES_MAX:
+                frame: dict[str, Any] = {
                     "type": "fs.write",
                     "request_id": str(uuid.uuid4()),
                     "scope": resolved.scope,
@@ -439,9 +447,41 @@ class Daemon:
                     "content_hash": actual_hash,
                     "parent_hash": parent_hash,
                     "size": len(content),
-                    "mime_type": _guess_mime(event.abs_path),
-                },
-            )
+                    "mime_type": mime_type,
+                }
+            else:
+                upload = await self._presigned_put(
+                    scope=resolved.scope,
+                    department_slug=resolved.department_slug,
+                    agent_slug=resolved.agent_slug,
+                    rel_path=resolved.rel_path,
+                    mime_type=mime_type,
+                )
+                if upload is None:
+                    log.warning(
+                        "skip large file %s — presign failed",
+                        event.abs_path,
+                    )
+                    return
+                ok = await self._put_to_s3(
+                    upload["presigned_url"], content, mime_type
+                )
+                if not ok:
+                    return
+                frame = {
+                    "type": "fs.write",
+                    "request_id": str(uuid.uuid4()),
+                    "scope": resolved.scope,
+                    "department_slug": resolved.department_slug,
+                    "agent_slug": resolved.agent_slug,
+                    "path": resolved.rel_path,
+                    "s3_key": upload["s3_key"],
+                    "content_hash": actual_hash,
+                    "parent_hash": parent_hash,
+                    "size": len(content),
+                    "mime_type": mime_type,
+                }
+            await self._send(ws, frame)
         except ConnectionClosed:
             return
 
@@ -460,6 +500,70 @@ class Daemon:
                 origin="local",
             )
         )
+
+    # Large-file upload helpers ----------------------------------------
+    async def _presigned_put(
+        self,
+        *,
+        scope: str,
+        department_slug: str | None,
+        agent_slug: str | None,
+        rel_path: str,
+        mime_type: str,
+    ) -> dict[str, Any] | None:
+        """Ask cloud to allocate an S3 key + presigned PUT URL."""
+        body = {
+            "scope": scope,
+            "department_slug": department_slug,
+            "agent_slug": agent_slug,
+            "path": rel_path,
+            "mime_type": mime_type,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=15) as http:
+                resp = await http.post(
+                    f"{self.credentials.api_base}/devices/me/fs/upload-url",
+                    json=body,
+                    headers={
+                        "Authorization": f"Bearer {self.credentials.token}"
+                    },
+                )
+        except Exception:
+            log.exception("upload-url request failed")
+            return None
+        if resp.status_code >= 400:
+            log.warning(
+                "upload-url declined (%s): %s",
+                resp.status_code,
+                resp.text[:200],
+            )
+            return None
+        try:
+            return resp.json()
+        except ValueError:
+            return None
+
+    async def _put_to_s3(
+        self, url: str, content: bytes, mime_type: str
+    ) -> bool:
+        try:
+            async with httpx.AsyncClient(timeout=300) as http:
+                resp = await http.put(
+                    url,
+                    content=content,
+                    headers={"Content-Type": mime_type},
+                )
+            if resp.status_code >= 400:
+                log.warning(
+                    "S3 PUT failed (%s): %s",
+                    resp.status_code,
+                    resp.text[:200],
+                )
+                return False
+            return True
+        except Exception:
+            log.exception("S3 PUT crashed")
+            return False
 
     # Conflict handling ---------------------------------------------------
     async def _handle_fs_conflict(self, frame: dict[str, Any]) -> None:
