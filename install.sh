@@ -102,8 +102,24 @@ else
 fi
 
 info "Installing xelos-edge..."
-"$RUNTIME_DIR/bin/python" -m pip install --quiet --upgrade pip
-"$RUNTIME_DIR/bin/python" -m pip install --quiet --upgrade "$PACKAGE_SPEC"
+VENV_PY="$RUNTIME_DIR/bin/python"
+
+# Ensure pip is available in the venv (some Linux distros ship Python without
+# ensurepip wired up by default — fall back to the bundled module, then to
+# system pip3/pip targeting the venv as a last resort).
+if ! "$VENV_PY" -m pip --version >/dev/null 2>&1; then
+    if ! "$VENV_PY" -m ensurepip --upgrade >/dev/null 2>&1; then
+        for sys_pip in pip3 pip; do
+            if command -v "$sys_pip" >/dev/null 2>&1; then
+                "$sys_pip" install --quiet --upgrade --target="$RUNTIME_DIR/lib" pip || true
+                break
+            fi
+        done
+    fi
+fi
+
+"$VENV_PY" -m pip install --quiet --upgrade pip
+"$VENV_PY" -m pip install --quiet --upgrade "$PACKAGE_SPEC"
 ok "Package installed"
 
 # Drop launcher in ~/.local/bin --------------------------------------------

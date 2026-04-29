@@ -1,4 +1,15 @@
-"""Outdated-version notifier. Best-effort, silent on failure."""
+"""Outdated-version notifier. Best-effort, silent on failure.
+
+We don't publish GitHub Releases — pip-installs target `@main` directly. So
+freshness is "is there a commit on main newer than what's installed?".
+We track the SHA we installed against in `update-check.json`. Cache layout:
+
+    {"installed_sha": "<short>", "latest_sha": "<short>", "checked_at": <ts>}
+
+`refresh_cache()` (called after `xelos update`) records the new HEAD SHA as
+both the installed and latest SHA. Subsequent runs only re-fetch latest and
+warn when it diverges from installed.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +24,7 @@ from . import __version__
 from .config import update_check_path
 
 CACHE_TTL_SECONDS = 24 * 60 * 60
-RELEASE_URL = "https://api.github.com/repos/markmelnic/xelos-edge/releases/latest"
+COMMIT_URL = "https://api.github.com/repos/markmelnic/xelos-edge/commits/main"
 
 
 def _read_cache() -> Optional[dict]:
@@ -26,72 +37,79 @@ def _read_cache() -> Optional[dict]:
         return None
 
 
-def _write_cache(latest: str) -> None:
+def _write_cache(data: dict) -> None:
     path = update_check_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"latest": latest, "checked_at": int(time.time())}))
+        path.write_text(json.dumps(data))
     except Exception:
         pass
 
 
-def _fetch_latest() -> Optional[str]:
+def _fetch_head_sha() -> Optional[str]:
+    """Return the short SHA of `main`'s HEAD commit, or None on any failure."""
     try:
-        resp = httpx.get(RELEASE_URL, timeout=2.0, headers={"Accept": "application/vnd.github+json"})
+        resp = httpx.get(
+            COMMIT_URL,
+            timeout=2.0,
+            headers={"Accept": "application/vnd.github+json"},
+        )
         if resp.status_code != 200:
             return None
-        tag = resp.json().get("tag_name")
-        if not isinstance(tag, str):
+        sha = resp.json().get("sha")
+        if not isinstance(sha, str) or len(sha) < 7:
             return None
-        return tag.lstrip("v")
+        return sha[:12]
     except Exception:
         return None
 
 
-def _is_newer(latest: str, current: str) -> bool:
-    def parse(v: str) -> tuple:
-        v = v.split("+", 1)[0].split("-", 1)[0]
-        parts = []
-        for p in v.split("."):
-            try:
-                parts.append(int(p))
-            except ValueError:
-                return ()
-        return tuple(parts)
-
-    lp, cp = parse(latest), parse(current)
-    if not lp or not cp:
-        return False
-    return lp > cp
-
-
 def maybe_warn_outdated(echo) -> None:
-    """Print stderr banner if a newer release exists. Never raises."""
+    """Print stderr banner if main has commits beyond the installed SHA."""
     if os.environ.get("XELOS_NO_UPDATE_CHECK") == "1":
         return
     if __version__ == "0.0.0+local":
         return
 
-    cache = _read_cache()
-    latest: Optional[str] = None
-    if cache and (time.time() - cache.get("checked_at", 0)) < CACHE_TTL_SECONDS:
-        latest = cache.get("latest")
-    else:
-        latest = _fetch_latest()
-        if latest:
-            _write_cache(latest)
+    cache = _read_cache() or {}
+    installed_sha = cache.get("installed_sha")
+    latest_sha = cache.get("latest_sha")
+    fresh = (time.time() - cache.get("checked_at", 0)) < CACHE_TTL_SECONDS
 
-    if not latest:
-        return
-    if _is_newer(latest, __version__):
-        echo(
-            f"! xelos v{latest} available (current v{__version__}). Run: xelos update",
-            err=True,
+    if not fresh or not latest_sha:
+        latest_sha = _fetch_head_sha()
+        if latest_sha is None:
+            return
+        # First-ever check: pin the installed SHA to current HEAD so we don't
+        # nag on initial run. Updates after this point will be detected.
+        if not installed_sha:
+            installed_sha = latest_sha
+        _write_cache(
+            {
+                "installed_sha": installed_sha,
+                "latest_sha": latest_sha,
+                "checked_at": int(time.time()),
+            }
         )
+
+    if not installed_sha or not latest_sha or installed_sha == latest_sha:
+        return
+    echo(
+        f"! xelos has updates on main (installed {installed_sha[:7]}, "
+        f"latest {latest_sha[:7]}). Run: xelos update",
+        err=True,
+    )
 
 
 def refresh_cache() -> None:
-    """Force a cache refresh. Call after a successful update."""
-    latest = _fetch_latest()
-    if latest:
-        _write_cache(latest)
+    """Pin cache to current HEAD. Call after a successful `xelos update`."""
+    sha = _fetch_head_sha()
+    if not sha:
+        return
+    _write_cache(
+        {
+            "installed_sha": sha,
+            "latest_sha": sha,
+            "checked_at": int(time.time()),
+        }
+    )

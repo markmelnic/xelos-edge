@@ -32,6 +32,7 @@ function Find-Python {
         @{ Cmd = "py"; Args = @("-3.12", "-V") },
         @{ Cmd = "py"; Args = @("-3.11", "-V") },
         @{ Cmd = "py"; Args = @("-3", "-V") },
+        @{ Cmd = "python3"; Args = @("-V") },
         @{ Cmd = "python"; Args = @("-V") }
     )
     foreach ($c in $candidates) {
@@ -41,7 +42,7 @@ function Find-Python {
                 if ($c.Cmd -eq "py") {
                     return @{ Cmd = "py"; Switch = $c.Args[0] }
                 }
-                return @{ Cmd = "python"; Switch = $null }
+                return @{ Cmd = $c.Cmd; Switch = $null }
             }
         } catch {
             continue
@@ -94,6 +95,22 @@ if (-not (Test-Path $VenvPython)) {
 }
 
 Write-Info "Installing xelos-edge..."
+
+# Ensure pip is available in the venv. ensurepip is the canonical bootstrap;
+# if that fails, try host pip / pip3 as a last resort.
+& $VenvPython -m pip --version *> $null
+if ($LASTEXITCODE -ne 0) {
+    & $VenvPython -m ensurepip --upgrade *> $null
+    if ($LASTEXITCODE -ne 0) {
+        foreach ($sysPip in @("pip3", "pip")) {
+            if (Get-Command $sysPip -ErrorAction SilentlyContinue) {
+                & $sysPip install --quiet --upgrade --target=(Join-Path $RuntimeDir "Lib\site-packages") pip
+                break
+            }
+        }
+    }
+}
+
 & $VenvPython -m pip install --quiet --upgrade pip
 & $VenvPython -m pip install --quiet --upgrade $PackageSpec
 Write-Ok "Package installed"
