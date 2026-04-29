@@ -63,12 +63,17 @@ function Invoke-Python {
 # --- Main ------------------------------------------------------------------
 Write-Info "Xelos Edge installer for Windows"
 
+function Confirm-YN($prompt) {
+    if ($env:XELOS_NONINTERACTIVE -eq "1") { return $true }
+    $ans = Read-Host "$prompt [Y/n]"
+    return ($ans -ne "n" -and $ans -ne "N")
+}
+
 $script:PythonInfo = Find-Python
 if ($null -eq $script:PythonInfo) {
     Write-Warn "No Python 3.11+ found on PATH."
     if (Get-Command winget -ErrorAction SilentlyContinue) {
-        $ans = Read-Host "Install Python 3.12 via winget now? [Y/n]"
-        if ($ans -ne "n" -and $ans -ne "N") {
+        if (Confirm-YN "Install Python 3.12 via winget now?") {
             winget install --id Python.Python.3.12 -e --accept-source-agreements --accept-package-agreements
             Write-Info "Reload your shell after winget finishes, then re-run this installer."
             exit 0
@@ -77,6 +82,26 @@ if ($null -eq $script:PythonInfo) {
     Write-Fail "Install Python 3.11+ from https://www.python.org/downloads/ and re-run."
 }
 Write-Ok ("Found Python: " + (Invoke-Python -V))
+
+# Node.js (Claude Code dependency).
+if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+    Write-Warn "Node.js not found (Claude Code needs it)."
+    if ((Get-Command winget -ErrorAction SilentlyContinue) -and (Confirm-YN "Install Node.js LTS via winget?")) {
+        winget install --id OpenJS.NodeJS.LTS -e --accept-source-agreements --accept-package-agreements
+    }
+} else {
+    Write-Ok ("Found Node: " + (node -v))
+}
+
+# Claude Code CLI.
+if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
+    Write-Warn "Claude Code CLI not found."
+    if ((Get-Command npm -ErrorAction SilentlyContinue) -and (Confirm-YN "Install Claude Code via npm?")) {
+        npm install -g "@anthropic-ai/claude-code"
+    }
+} else {
+    Write-Ok ("Found Claude Code: " + (claude --version 2>$null))
+}
 
 if (-not (Test-Path $XelosHome)) {
     New-Item -ItemType Directory -Path $XelosHome -Force | Out-Null
@@ -143,10 +168,17 @@ if ($paths -notcontains $BinDir) {
     Write-Ok "$BinDir already on PATH"
 }
 
+# --- Claude Code login -----------------------------------------------------
+if (Get-Command claude -ErrorAction SilentlyContinue) {
+    if ($env:XELOS_NONINTERACTIVE -ne "1" -and (Confirm-YN "Log in to Claude Code now? (opens a browser)")) {
+        claude login
+    }
+}
+
 Write-Host ""
 Write-Ok "Done."
 Write-Host ""
 Write-Host "Next steps:"
 Write-Host "  1. Generate a pair code in the Xelos UI under Devices."
-Write-Host "  2. Run:  xelos pair <CODE>   (add --api <url> for staging / self-hosted)"
-Write-Host "  3. Then: xelos serve"
+Write-Host "  2. Run:  xelos     (interactive menu — pair, serve, status, doctor)"
+Write-Host "     Or:   xelos pair <CODE>   (one-shot, scriptable)"

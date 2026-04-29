@@ -58,7 +58,7 @@ def resolve(*, root: Path, abs_path: Path) -> ResolvedPath | None:
         if len(parts) < 2:
             return None
         return ResolvedPath(
-            scope="organization",
+            scope="workspace",
             department_slug=None,
             agent_slug=None,
             rel_path="/".join(parts[1:]),

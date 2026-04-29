@@ -66,11 +66,15 @@ class Daemon:
         self._stop = asyncio.Event()
         self._ws: Any = None
         self._state = StateDB()
-        self._mirror: FsMirror | None = None
+        # Devices span multiple workspaces — one FsMirror per workspace_slug,
+        # rooted at `~/.xelos/mirror/<workspace_slug>/`. The watcher is shared
+        # across them all (rooted at `~/.xelos/mirror`).
+        self._mirrors: dict[str, FsMirror] = {}
         self._watcher: FsWatcher | None = None
         self._runs: RunSupervisor | None = None
         self._hydrate_lock = asyncio.Lock()
         self._hydrated_once = False
+        self._known_orgs: list[dict[str, Any]] = []
 
     async def run(self) -> None:
         if self.options.install_signal_handlers:
@@ -78,7 +82,7 @@ class Daemon:
         EVENTS.publish(
             "daemon.started",
             device_id=str(self.credentials.device_id),
-            organization_id=str(self.credentials.organization_id),
+            workspace_id=str(self.credentials.workspace_id),
             api_base=self.credentials.api_base,
         )
 
@@ -213,10 +217,10 @@ class Daemon:
         log.debug("unknown frame type=%s — ignoring", ftype)
 
     async def _on_ready(self) -> None:
-        """Reconcile every connect; first run reduces to a plain hydrate."""
+        """Reconcile every connect; runs once per known org workspace."""
         async with self._hydrate_lock:
-            mirror = await self._ensure_mirror()
-            if mirror is None:
+            primer = await self._ensure_mirror()
+            if primer is None:
                 log.warning("reconcile: mirror init failed; skipping")
                 return
 
@@ -232,60 +236,124 @@ class Daemon:
                 if self._watcher is not None:
                     self._watcher.suppress(path)
 
-            try:
-                summary = await reconcile_with_cloud(
-                    credentials=self.credentials,
-                    mirror=mirror,
-                    state=self._state,
-                    send=_send_via_ws,
-                    suppress=_suppress,
-                )
-                self._hydrated_once = True
-                log.info(
-                    "reconcile complete: pulled=%d pushed=%d "
-                    "deleted_local=%d deleted_remote=%d "
-                    "conflicts=%d errors=%d in_sync=%d",
-                    summary.pulled,
-                    summary.pushed + summary.pushed_new,
-                    summary.deleted_local,
-                    summary.deleted_remote,
-                    summary.conflicts,
-                    summary.errors,
-                    summary.in_sync,
-                )
-                EVENTS.publish(
-                    "reconcile.completed",
-                    pulled=summary.pulled,
-                    pushed=summary.pushed + summary.pushed_new,
-                    deleted_local=summary.deleted_local,
-                    deleted_remote=summary.deleted_remote,
-                    conflicts=summary.conflicts,
-                    errors=summary.errors,
-                    in_sync=summary.in_sync,
-                )
-            except Exception as exc:
-                log.exception("reconcile failed")
-                EVENTS.publish("reconcile.failed", error=str(exc))
-                return
+            # Run reconcile once per org we know about; the manifest is
+            # multi-org but each mirror filters to its own slug.
+            mirrors_snapshot = list(self._mirrors.values())
+            for mirror in mirrors_snapshot:
+                try:
+                    summary = await reconcile_with_cloud(
+                        credentials=self.credentials,
+                        mirror=mirror,
+                        state=self._state,
+                        send=_send_via_ws,
+                        suppress=_suppress,
+                    )
+                    self._hydrated_once = True
+                    log.info(
+                        "reconcile complete (%s): pulled=%d pushed=%d "
+                        "deleted_local=%d deleted_remote=%d "
+                        "conflicts=%d errors=%d in_sync=%d",
+                        mirror.workspace_slug,
+                        summary.pulled,
+                        summary.pushed + summary.pushed_new,
+                        summary.deleted_local,
+                        summary.deleted_remote,
+                        summary.conflicts,
+                        summary.errors,
+                        summary.in_sync,
+                    )
+                    EVENTS.publish(
+                        "reconcile.completed",
+                        workspace_slug=mirror.workspace_slug,
+                        pulled=summary.pulled,
+                        pushed=summary.pushed + summary.pushed_new,
+                        deleted_local=summary.deleted_local,
+                        deleted_remote=summary.deleted_remote,
+                        conflicts=summary.conflicts,
+                        errors=summary.errors,
+                        in_sync=summary.in_sync,
+                    )
+                except Exception as exc:
+                    log.exception(
+                        "reconcile failed for %s", mirror.workspace_slug
+                    )
+                    EVENTS.publish(
+                        "reconcile.failed",
+                        workspace_slug=mirror.workspace_slug,
+                        error=str(exc),
+                    )
 
         await self._ensure_watcher()
 
-    async def _ensure_mirror(self) -> FsMirror | None:
-        if self._mirror is not None:
-            return self._mirror
+    def _mirror_for_path(self, abs_path: Any) -> FsMirror | None:
+        """Resolve an absolute path back to its owning org mirror.
+
+        Layout is `~/.xelos/mirror/<workspace_slug>/...`. Walks every active
+        mirror and returns whichever one contains `abs_path`.
+        """
+        from pathlib import Path
+
+        try:
+            p = Path(abs_path).resolve()
+        except OSError:
+            return None
+        for mirror in self._mirrors.values():
+            try:
+                p.relative_to(mirror.root.resolve())
+            except ValueError:
+                continue
+            return mirror
+        return None
+
+    async def _ensure_mirror(
+        self, workspace_slug: str | None = None
+    ) -> FsMirror | None:
+        """Get or lazily create the FsMirror for `workspace_slug`.
+
+        When called without `workspace_slug`, fetches the manifest, primes one
+        mirror per org listed there, and returns the first one (legacy
+        callers expect a single mirror back).
+        """
+        if workspace_slug:
+            mirror = self._mirrors.get(workspace_slug)
+            if mirror is None:
+                mirror = FsMirror(workspace_slug=workspace_slug, state=self._state)
+                self._mirrors[workspace_slug] = mirror
+            return mirror
+
         try:
             manifest = await fetch_manifest(self.credentials)
         except Exception:
             log.exception("manifest fetch failed in mirror init")
             return None
-        org_slug = manifest.get("organization_slug")
-        if not org_slug:
+        orgs = manifest.get("workspaces") or []
+        if not orgs:
+            # Legacy single-org manifest payload.
+            single = manifest.get("workspace_slug")
+            if single:
+                orgs = [{"slug": single}]
+        if not orgs:
             return None
-        self._mirror = FsMirror(org_slug=org_slug, state=self._state)
-        return self._mirror
+        self._known_orgs = orgs
+        first: FsMirror | None = None
+        for o in orgs:
+            slug = o.get("slug")
+            if not isinstance(slug, str) or not slug:
+                continue
+            m = self._mirrors.get(slug)
+            if m is None:
+                m = FsMirror(workspace_slug=slug, state=self._state)
+                self._mirrors[slug] = m
+            if first is None:
+                first = m
+        return first
 
     async def _handle_fs_push(self, frame: dict[str, Any]) -> None:
-        mirror = await self._ensure_mirror()
+        workspace_slug = frame.get("workspace_slug")
+        if not isinstance(workspace_slug, str) or not workspace_slug:
+            log.warning("fs.push missing workspace_slug; ignoring")
+            return
+        mirror = await self._ensure_mirror(workspace_slug)
         if mirror is None:
             log.warning("fs.push received before mirror ready; ignoring")
             return
@@ -353,7 +421,10 @@ class Daemon:
             log.exception("fs.push apply failed: %s", rel)
 
     async def _handle_fs_delete(self, frame: dict[str, Any]) -> None:
-        mirror = await self._ensure_mirror()
+        workspace_slug = frame.get("workspace_slug")
+        if not isinstance(workspace_slug, str) or not workspace_slug:
+            return
+        mirror = await self._ensure_mirror(workspace_slug)
         if mirror is None:
             return
         try:
@@ -425,15 +496,26 @@ class Daemon:
     async def _ensure_watcher(self) -> None:
         if self._watcher is not None:
             return
+        # Multi-org devices: watch the umbrella `~/.xelos/mirror` root,
+        # not just one org subdir. `_on_local_change` derives the org
+        # from the changed path's first segment.
         mirror = await self._ensure_mirror()
         if mirror is None:
             return
-        watcher = FsWatcher(root=mirror.root, on_event=self._on_local_change)
+        # mirror.root → `~/.xelos/mirror/<workspace_slug>`; one level up is
+        # the multi-org root.
+        from pathlib import Path
+
+        watcher_root = Path(mirror.root).parent
+        watcher = FsWatcher(root=watcher_root, on_event=self._on_local_change)
         await watcher.start()
         self._watcher = watcher
 
     async def _on_local_change(self, event: FsEvent) -> None:
-        mirror = self._mirror
+        # Derive the changed file's org from its first path segment
+        # under `~/.xelos/mirror/<workspace_slug>/...`. Multi-org devices have
+        # any number of mirrors; pick the matching one.
+        mirror = self._mirror_for_path(event.abs_path)
         if mirror is None:
             return
 
@@ -454,6 +536,7 @@ class Daemon:
                 {
                     "type": "fs.delete",
                     "request_id": str(uuid.uuid4()),
+                    "workspace_slug": mirror.workspace_slug,
                     "scope": resolved.scope,
                     "department_slug": resolved.department_slug,
                     "agent_slug": resolved.agent_slug,
@@ -490,6 +573,7 @@ class Daemon:
                 frame: dict[str, Any] = {
                     "type": "fs.write",
                     "request_id": str(uuid.uuid4()),
+                    "workspace_slug": mirror.workspace_slug,
                     "scope": resolved.scope,
                     "department_slug": resolved.department_slug,
                     "agent_slug": resolved.agent_slug,
@@ -502,6 +586,7 @@ class Daemon:
                 }
             else:
                 upload = await self._presigned_put(
+                    workspace_slug=mirror.workspace_slug,
                     scope=resolved.scope,
                     department_slug=resolved.department_slug,
                     agent_slug=resolved.agent_slug,
@@ -522,6 +607,7 @@ class Daemon:
                 frame = {
                     "type": "fs.write",
                     "request_id": str(uuid.uuid4()),
+                    "workspace_slug": mirror.workspace_slug,
                     "scope": resolved.scope,
                     "department_slug": resolved.department_slug,
                     "agent_slug": resolved.agent_slug,
@@ -563,6 +649,7 @@ class Daemon:
     async def _presigned_put(
         self,
         *,
+        workspace_slug: str,
         scope: str,
         department_slug: str | None,
         agent_slug: str | None,
@@ -570,6 +657,7 @@ class Daemon:
         mime_type: str,
     ) -> dict[str, Any] | None:
         body = {
+            "workspace_slug": workspace_slug,
             "scope": scope,
             "department_slug": department_slug,
             "agent_slug": agent_slug,
@@ -624,7 +712,10 @@ class Daemon:
 
     async def _handle_fs_conflict(self, frame: dict[str, Any]) -> None:
         """Cloud diverged. Stash local copy; cloud version wins (LWW)."""
-        mirror = self._mirror
+        workspace_slug = frame.get("workspace_slug")
+        if not isinstance(workspace_slug, str) or not workspace_slug:
+            return
+        mirror = await self._ensure_mirror(workspace_slug)
         if mirror is None:
             return
         rel = frame.get("path")
@@ -634,7 +725,7 @@ class Daemon:
             from .fs_mirror import _resolve_target
 
             target = _resolve_target(
-                org_slug=mirror.org_slug,
+                workspace_slug=mirror.workspace_slug,
                 scope=frame["scope"],
                 department_slug=frame.get("department_slug"),
                 agent_slug=frame.get("agent_slug"),

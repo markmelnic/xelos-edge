@@ -15,13 +15,13 @@ from .state_db import FileState, StateDB
 log = logging.getLogger(__name__)
 
 
-def org_root(org_slug: str) -> Path:
-    return _xelos_home() / "mirror" / org_slug
+def org_root(workspace_slug: str) -> Path:
+    return _xelos_home() / "mirror" / workspace_slug
 
 
 def _resolve_target(
     *,
-    org_slug: str,
+    workspace_slug: str,
     scope: str,
     department_slug: str | None,
     agent_slug: str | None,
@@ -29,12 +29,12 @@ def _resolve_target(
 ) -> Path:
     """Layout matches the cloud S3 prefix.
 
-        organization → {org}/_org/{rel}
+        workspace → {org}/_org/{rel}
         department   → {org}/departments/{dept}/{rel}
         agent        → {org}/departments/{dept}/agents/{agent}/{rel}
     """
-    base = org_root(org_slug)
-    if scope == "organization":
+    base = org_root(workspace_slug)
+    if scope == "workspace":
         prefix = base / "_org"
     elif scope == "department":
         if not department_slug:
@@ -78,10 +78,10 @@ class WriteOutcome:
 
 
 class FsMirror:
-    def __init__(self, *, org_slug: str, state: StateDB) -> None:
-        self.org_slug = org_slug
+    def __init__(self, *, workspace_slug: str, state: StateDB) -> None:
+        self.workspace_slug = workspace_slug
         self.state = state
-        self.root = org_root(org_slug)
+        self.root = org_root(workspace_slug)
         self.root.mkdir(parents=True, exist_ok=True)
 
     def write_file(
@@ -96,7 +96,7 @@ class FsMirror:
         origin: str = "cloud",
     ) -> WriteOutcome:
         target = _resolve_target(
-            org_slug=self.org_slug,
+            workspace_slug=self.workspace_slug,
             scope=scope,
             department_slug=department_slug,
             agent_slug=agent_slug,
@@ -144,7 +144,7 @@ class FsMirror:
         rel_path: str,
     ) -> Path:
         target = _resolve_target(
-            org_slug=self.org_slug,
+            workspace_slug=self.workspace_slug,
             scope=scope,
             department_slug=department_slug,
             agent_slug=agent_slug,
@@ -162,7 +162,7 @@ class FsMirror:
         rel_path: str,
     ) -> Path | None:
         target = _resolve_target(
-            org_slug=self.org_slug,
+            workspace_slug=self.workspace_slug,
             scope=scope,
             department_slug=department_slug,
             agent_slug=agent_slug,

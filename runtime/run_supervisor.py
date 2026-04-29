@@ -160,15 +160,15 @@ class RunSupervisor:
     def _build_spec(
         self, run_id: str, frame: dict[str, Any]
     ) -> JobSpec | None:
-        org_slug = frame.get("organization_slug")
+        workspace_slug = frame.get("workspace_slug")
         dept_slug = frame.get("department_slug")
         agent = frame.get("agent") or {}
         agent_slug = agent.get("slug")
-        if not (org_slug and dept_slug and agent_slug):
+        if not (workspace_slug and dept_slug and agent_slug):
             return None
 
         cwd = (
-            org_root(org_slug)
+            org_root(workspace_slug)
             / "departments"
             / dept_slug
             / "agents"

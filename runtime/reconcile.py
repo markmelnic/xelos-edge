@@ -83,11 +83,16 @@ async def reconcile_with_cloud(
         summary.errors += 1
         return summary
 
-    if manifest.get("organization_slug") != mirror.org_slug:
+    # Multi-org manifests carry `workspace_slug` per entry; filter to
+    # the entries belonging to this mirror's workspace. Legacy manifests
+    # (no per-entry slug) are accepted only when the top-level slug
+    # matches.
+    legacy_top_slug = manifest.get("workspace_slug")
+    if legacy_top_slug and legacy_top_slug != mirror.workspace_slug:
         log.error(
-            "org_slug mismatch (manifest=%s, mirror=%s) — aborting",
-            manifest.get("organization_slug"),
-            mirror.org_slug,
+            "workspace_slug mismatch (manifest=%s, mirror=%s) — aborting",
+            legacy_top_slug,
+            mirror.workspace_slug,
         )
         summary.errors += 1
         return summary
@@ -95,6 +100,9 @@ async def reconcile_with_cloud(
     manifest_by_path: dict[str, dict[str, Any]] = {}
     folders: list[dict[str, Any]] = []
     for entry in manifest.get("entries", []):
+        entry_slug = entry.get("workspace_slug") or legacy_top_slug
+        if entry_slug and entry_slug != mirror.workspace_slug:
+            continue
         kind = entry.get("kind")
         if kind == "folder":
             folders.append(entry)
@@ -103,7 +111,7 @@ async def reconcile_with_cloud(
             continue
         try:
             target = _resolve_target(
-                org_slug=mirror.org_slug,
+                workspace_slug=mirror.workspace_slug,
                 scope=entry["scope"],
                 department_slug=entry.get("department_slug"),
                 agent_slug=entry.get("agent_slug"),

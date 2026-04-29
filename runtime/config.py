@@ -33,7 +33,7 @@ class Credentials:
     api_base: str
     websocket_url: str
     device_id: str
-    organization_id: str
+    workspace_id: str
     token: str
 
     @classmethod

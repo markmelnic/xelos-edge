@@ -30,17 +30,28 @@ def _setup_logging(verbose: bool) -> None:
     )
 
 
-@click.group()
+@click.group(invoke_without_command=True)
 @click.version_option(__version__, prog_name="xelos")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose logging.")
 @click.pass_context
 def main(ctx: click.Context, verbose: bool) -> None:
-    """Xelos Edge daemon — pair this machine and run agents locally."""
+    """Xelos Edge — pair this machine, run agents locally.
+
+    Run with no subcommand to launch the interactive menu (pair,
+    serve, status, doctor, update, logout). Subcommands stay
+    available for scripts and headless boxes.
+    """
     ctx.ensure_object(dict)
     ctx.obj["verbose"] = verbose
     _setup_logging(verbose)
     if ctx.invoked_subcommand != "update":
         maybe_warn_outdated(click.echo)
+    if ctx.invoked_subcommand is None:
+        # Bare `xelos` → interactive launcher (TTY only).
+        if not sys.stdout.isatty():
+            click.echo(ctx.get_help())
+            return
+        _run_launcher_loop()
 
 
 @main.command("pair")
@@ -59,49 +70,12 @@ def main(ctx: click.Context, verbose: bool) -> None:
 )
 def pair_cmd(code: str, api_base: str, force: bool) -> None:
     """Redeem a pair code and write credentials."""
-    existing = Credentials.load()
-    if existing is not None and not force:
+    if Credentials.load() is not None and not force:
         click.echo(
-            f"Already paired with device {existing.device_id} on {existing.api_base}.\n"
-            f"Re-run with --force to replace.",
-            err=True,
+            "Already paired. Re-run with --force to replace.", err=True
         )
         sys.exit(2)
-
-    fp = host_fingerprint()
-    caps = detect_capabilities()
-    click.echo(f"Pairing… (fingerprint={fp[:12]}…, claude_code={caps.get('claude_code_version') or 'missing'})")
-
-    try:
-        result = asyncio.run(
-            pair(
-                api_base=api_base,
-                code=code.strip().upper(),
-                fingerprint=fp,
-                capabilities=caps,
-            )
-        )
-    except ApiError as exc:
-        msg = _format_api_error(exc)
-        click.echo(f"Pair failed: {msg}", err=True)
-        sys.exit(1)
-    except Exception as exc:
-        click.echo(f"Pair failed: {exc}", err=True)
-        sys.exit(1)
-
-    creds = Credentials(
-        api_base=api_base.rstrip("/"),
-        websocket_url=result["websocket_url"],
-        device_id=result["device_id"],
-        organization_id=result["organization_id"],
-        token=result["token"],
-    )
-    creds.save()
-    click.echo(f"Paired. Credentials at {credentials_path()}")
-    click.echo(f"  device_id       = {creds.device_id}")
-    click.echo(f"  organization_id = {creds.organization_id}")
-    click.echo(f"  websocket_url   = {creds.websocket_url}")
-    click.echo("\nRun `xelos serve` to start the daemon.")
+    _do_pair_interactive(code=code, api_base=api_base, force=force)
 
 
 @main.command("serve")
@@ -174,7 +148,7 @@ def status_cmd() -> None:
         click.echo("Not paired.")
     else:
         click.echo(f"Paired with device {creds.device_id}")
-        click.echo(f"  organization_id = {creds.organization_id}")
+        click.echo(f"  workspace_id = {creds.workspace_id}")
         click.echo(f"  api_base        = {creds.api_base}")
         click.echo(f"  websocket_url   = {creds.websocket_url}")
     click.echo("Capabilities:")
@@ -316,6 +290,97 @@ def _format_api_error(exc: ApiError) -> str:
         if isinstance(detail, list) and detail:
             return f"{exc.status} {detail[0].get('msg', detail[0])}"
     return f"{exc.status} {exc.message}"
+
+
+def _run_launcher_loop() -> None:
+    """Drive the interactive menu. Each menu choice runs its action,
+    then returns here so the user can pick another. Exits when the user
+    explicitly quits.
+    """
+    from .launcher import run_launcher
+
+    while True:
+        result = run_launcher()
+        if result is None:
+            return
+
+        # Pair flow: launcher returns a dict with the form values.
+        if isinstance(result, dict) and result.get("action") == "pair":
+            _do_pair_interactive(
+                code=result["code"], api_base=result["api"], force=True
+            )
+            click.pause("\nPress any key to return to the menu… ")
+            continue
+
+        if result == "serve":
+            creds = Credentials.load()
+            if creds is None:
+                click.echo("Not paired yet — run Pair first.", err=True)
+                click.pause()
+                continue
+            from .tui import run_tui
+
+            run_tui(credentials=creds)
+            continue
+
+        if result == "logout":
+            Credentials.clear()
+            click.echo("Credentials cleared.")
+            click.pause("\nPress any key to return to the menu… ")
+            continue
+
+        if result == "update":
+            # Defer to the existing update_cmd via subprocess so the
+            # in-process Click context isn't tangled with a self-upgrade.
+            try:
+                subprocess.check_call([sys.executable, "-m", "runtime.cli", "update"])
+            except subprocess.CalledProcessError as exc:
+                click.echo(f"Update failed (exit {exc.returncode}).", err=True)
+            click.pause("\nPress any key to return to the menu… ")
+            continue
+
+
+def _do_pair_interactive(*, code: str, api_base: str, force: bool) -> None:
+    """Pair flow shared between the `pair` subcommand + the launcher."""
+    existing = Credentials.load()
+    if existing is not None and not force:
+        click.echo(
+            f"Already paired with device {existing.device_id} on {existing.api_base}.",
+            err=True,
+        )
+        return
+
+    fp = host_fingerprint()
+    caps = detect_capabilities()
+    click.echo(
+        f"Pairing… (fingerprint={fp[:12]}…, "
+        f"claude_code={caps.get('claude_code_version') or 'missing'})"
+    )
+    try:
+        result = asyncio.run(
+            pair(
+                api_base=api_base,
+                code=code.strip().upper(),
+                fingerprint=fp,
+                capabilities=caps,
+            )
+        )
+    except ApiError as exc:
+        click.echo(f"Pair failed: {_format_api_error(exc)}", err=True)
+        return
+    except Exception as exc:
+        click.echo(f"Pair failed: {exc}", err=True)
+        return
+
+    creds = Credentials(
+        api_base=api_base.rstrip("/"),
+        websocket_url=result["websocket_url"],
+        device_id=result["device_id"],
+        workspace_id=result["workspace_id"],
+        token=result["token"],
+    )
+    creds.save()
+    click.echo(f"Paired. Credentials at {credentials_path()}")
 
 
 if __name__ == "__main__":
