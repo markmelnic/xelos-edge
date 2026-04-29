@@ -86,6 +86,29 @@ class _Debounced(FileSystemEventHandler):
         ev = FsEvent(abs_path=Path(abs_path), deleted=deleted)
         asyncio.create_task(self._on_event(ev))
 
+    async def flush(self) -> None:
+        """Fire all pending debounced events immediately and wait for them.
+
+        Used when a run is about to terminate — we don't want CC's last
+        writes to sit in the debounce window while the cloud thinks the
+        run already finished.
+        """
+        with self._lock:
+            pending = list(self._pending.items())
+            for abs_path, handle in pending:
+                handle.cancel()
+            self._pending.clear()
+        # Walk pending out of the lock so handlers don't deadlock.
+        tasks: list[asyncio.Task] = []
+        for abs_path, _ in pending:
+            ev = FsEvent(
+                abs_path=Path(abs_path),
+                deleted=not Path(abs_path).exists(),
+            )
+            tasks.append(asyncio.create_task(self._on_event(ev)))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     def on_created(self, event: FileSystemEvent) -> None:
         if event.is_directory:
             return
@@ -120,6 +143,7 @@ class FsWatcher:
         self.root = root
         self._on_event = on_event
         self._observer: Observer | None = None
+        self._handler: _Debounced | None = None
         self._suppressed: dict[str, float] = {}
 
     def suppress(self, abs_path: str | Path, seconds: float = ECHO_SUPPRESS_SECONDS) -> None:
@@ -137,7 +161,13 @@ class FsWatcher:
         observer.schedule(handler, str(self.root), recursive=True)
         observer.start()
         self._observer = observer
+        self._handler = handler
         log.info("fs watcher started on %s", self.root)
+
+    async def flush(self) -> None:
+        """Force any pending debounced writes through immediately."""
+        if self._handler is not None:
+            await self._handler.flush()
 
     async def stop(self) -> None:
         if self._observer is None:

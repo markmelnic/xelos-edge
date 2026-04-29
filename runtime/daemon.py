@@ -336,7 +336,21 @@ class Daemon:
         caps = detect_capabilities()
         cap = max(1, int(caps.get("max_concurrent_runs") or 4))
 
+        TERMINAL_FRAME_TYPES = {"run.completed", "run.failed", "run.awaiting_approval"}
+
         async def _send(frame: dict[str, Any]) -> None:
+            # Before reporting the run terminal, flush any pending watcher
+            # writes so CC's last file mutations land in the cloud BEFORE
+            # the cloud finalises the run record. Otherwise a delegated
+            # follow-up agent could read stale files.
+            if (
+                frame.get("type") in TERMINAL_FRAME_TYPES
+                and self._watcher is not None
+            ):
+                try:
+                    await self._watcher.flush()
+                except Exception:
+                    log.exception("watcher flush failed before terminal frame")
             current_ws = self._ws
             if current_ws is None:
                 # Cloud times the run out on its side.

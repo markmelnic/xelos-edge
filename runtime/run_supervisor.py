@@ -86,9 +86,31 @@ class RunSupervisor:
                 ),
             )
 
+            files_modified: list[str] = []
             try:
                 async for ev in proc.stream():
+                    # Track file mutations so we can emit a summary step
+                    # before terminal — gives the cloud audit timeline a
+                    # canonical "what files changed" without parsing every
+                    # tool_call.
+                    if ev.type == "tool_call":
+                        tool_name = (ev.data or {}).get("name")
+                        if tool_name in ("Write", "Edit", "MultiEdit"):
+                            args = (ev.data or {}).get("arguments") or {}
+                            fp = args.get("file_path") or args.get("path")
+                            if isinstance(fp, str) and fp not in files_modified:
+                                files_modified.append(fp)
                     await self._send_event(run_id, ev)
+
+                if files_modified:
+                    await self._send_event(
+                        run_id,
+                        StepEvent(
+                            type="files_modified",
+                            data={"paths": files_modified},
+                        ),
+                    )
+
                 # Synthesise a terminal frame if proc never emitted one.
                 exit_code = (
                     proc._proc.returncode  # noqa: SLF001
@@ -102,6 +124,7 @@ class RunSupervisor:
                         error=f"claude_exit_code_{exit_code}",
                         usage=proc.final_usage,
                         external_session_id=proc.session_id,
+                        files_modified=files_modified,
                     )
                 else:
                     await self._send_terminal(
@@ -109,6 +132,7 @@ class RunSupervisor:
                         kind="completed",
                         usage=proc.final_usage,
                         external_session_id=proc.session_id,
+                        files_modified=files_modified,
                     )
             except ClaudeNotFound as exc:
                 await self._send_terminal(
@@ -222,6 +246,7 @@ class RunSupervisor:
         trace: str | None = None,
         usage: dict[str, Any] | None = None,
         external_session_id: str | None = None,
+        files_modified: list[str] | None = None,
     ) -> None:
         frame: dict[str, Any] = {
             "type": f"run.{kind}",
@@ -236,4 +261,6 @@ class RunSupervisor:
             frame["usage"] = usage
         if external_session_id:
             frame["external_session_id"] = external_session_id
+        if files_modified:
+            frame["files_modified"] = files_modified
         await self._send(frame)
