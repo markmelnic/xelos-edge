@@ -159,10 +159,15 @@ async def reconcile_with_cloud(
                 if resolved is None:
                     state.delete(abs_path)
                     continue
+                # `workspace_slug` is mandatory upstream — `apply_device_delete`
+                # rejects frames without it. The watcher path supplies it; the
+                # reconcile path used to omit it, so pushed deletes silently
+                # never landed.
                 await send(
                     {
                         "type": "fs.delete",
                         "request_id": str(uuid.uuid4()),
+                        "workspace_slug": mirror.workspace_slug,
                         "scope": resolved.scope,
                         "department_slug": resolved.department_slug,
                         "agent_slug": resolved.agent_slug,
@@ -427,10 +432,13 @@ async def _push_file(
         return
     content = path_obj.read_bytes()
     actual_hash = hashlib.sha256(content).hexdigest()
+    # `workspace_slug` is mandatory upstream — `apply_device_write` rejects
+    # frames without it. Match the watcher-driven path's frame shape.
     await send(
         {
             "type": "fs.write",
             "request_id": str(uuid.uuid4()),
+            "workspace_slug": mirror.workspace_slug,
             "scope": resolved.scope,
             "department_slug": resolved.department_slug,
             "agent_slug": resolved.agent_slug,

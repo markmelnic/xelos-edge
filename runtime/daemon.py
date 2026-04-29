@@ -488,7 +488,18 @@ class Daemon:
                 # Cloud times the run out on its side.
                 log.debug("supervisor send dropped (ws closed): %s", frame.get("type"))
                 return
-            await self._send(current_ws, frame)
+            try:
+                await self._send(current_ws, frame)
+            except (ConnectionClosed, OSError) as exc:
+                # Disconnect raced our send; reconnect+reconcile picks up the
+                # diff. We don't want this to crash the run-supervising
+                # coroutine — the cloud will time the run out and the
+                # supervisor stays available for the next session.
+                log.warning(
+                    "supervisor send raced disconnect (%s): %s",
+                    type(exc).__name__,
+                    frame.get("type"),
+                )
 
         self._runs = RunSupervisor(send=_send, max_concurrent_runs=cap)
         return self._runs
