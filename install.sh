@@ -162,5 +162,5 @@ esac
 ok "Done."
 printf "\nNext steps:\n"
 note "1. Generate a pair code in the Xelos UI under Devices."
-note "2. Run:  xelos pair <CODE> --api <api-base-url>"
+note "2. Run:  xelos pair <CODE>   (add --api <url> for staging / self-hosted)"
 note "3. Then: xelos serve"

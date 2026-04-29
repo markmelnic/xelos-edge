@@ -61,8 +61,16 @@ class StateDB:
         return conn
 
     def _init_schema(self) -> None:
-        with self._tx() as conn:
-            conn.executescript(_SCHEMA)
+        # `executescript` implicitly commits any pending transaction, so it
+        # cannot run inside our manual BEGIN/COMMIT wrapper (Python 3.14
+        # raises "cannot commit - no transaction is active" otherwise).
+        # Schema statements are all `IF NOT EXISTS`, so autocommit is safe.
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.executescript(_SCHEMA)
+            finally:
+                conn.close()
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:

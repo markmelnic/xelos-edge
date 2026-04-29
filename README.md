@@ -44,8 +44,11 @@ In the Xelos UI, open **Devices → Pair Device**. Copy the pair code,
 then on the target machine:
 
 ```sh
-xelos pair <CODE> --api https://api.example.com
+xelos pair <CODE>
 ```
+
+Defaults to the production API at `https://xelos-api-production.up.railway.app`.
+Override with `--api <url>` for staging / self-hosted deployments.
 
 The daemon stores a long-lived token at `~/.xelos/credentials`
 (chmod 600 on POSIX; ACL-protected user-scope on Windows).
