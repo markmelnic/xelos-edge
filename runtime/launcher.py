@@ -100,33 +100,40 @@ def _read_key() -> str:
     import termios
     import tty
 
+    # Read raw bytes via `os.read(fd, ...)` rather than `sys.stdin.read`.
+    # The text wrapper's internal buffer hides follow-up bytes from
+    # `select()`, so a `\x1b[A` arrow burst would look like a lone ESC and
+    # the launcher would treat it as a quit.
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
-        ch = sys.stdin.read(1)
-        if ch == "\x03":
+        first = os.read(fd, 1)
+        if first == b"\x03":
             raise KeyboardInterrupt
-        if ch in ("\r", "\n"):
+        if first in (b"\r", b"\n"):
             return "enter"
-        if ch == "\x1b":
-            # CSI follow-up bytes arrive within microseconds; 50ms is generous.
-            ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+        if first == b"\x1b":
+            # CSI tail (`[A`/`[B`/`[C`/`[D`) lands within milliseconds; 150ms
+            # is generous even over latent SSH/PTY links and still feels
+            # instant when the user actually pressed plain Esc.
+            ready, _, _ = select.select([fd], [], [], 0.15)
             if not ready:
                 return "esc"
-            if sys.stdin.read(1) != "[":
-                return "esc"
-            ready, _, _ = select.select([sys.stdin], [], [], 0.05)
-            if not ready:
-                return "esc"
-            arrow = sys.stdin.read(1)
-            return {
-                "A": "up",
-                "B": "down",
-                "C": "right",
-                "D": "left",
-            }.get(arrow, "")
-        return ch
+            tail = os.read(fd, 8)
+            if tail.startswith(b"[A"):
+                return "up"
+            if tail.startswith(b"[B"):
+                return "down"
+            if tail.startswith(b"[C"):
+                return "right"
+            if tail.startswith(b"[D"):
+                return "left"
+            return "esc"
+        try:
+            return first.decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 

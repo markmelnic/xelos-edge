@@ -242,7 +242,24 @@ def update_cmd(ref: str | None, dry_run: bool) -> None:
             err=True,
         )
 
-    cmd = [sys.executable, "-m", "pip", "install", "--upgrade", spec]
+    # `--force-reinstall --no-deps` is required: we ship from `@main` so the
+    # package version in pyproject.toml stays "0.1.0" even when the git SHA
+    # advances, and plain `--upgrade` would consider the install satisfied
+    # and skip overwriting site-packages. `--no-cache-dir` bypasses any
+    # cached wheel from a previous install of the same SHA. Deps don't
+    # change between SHAs in practice; rerun without `--no-deps` if you've
+    # added/removed a dependency.
+    cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        "--force-reinstall",
+        "--no-deps",
+        "--no-cache-dir",
+        spec,
+    ]
     click.echo(f"$ {' '.join(cmd)}")
     if dry_run:
         return
@@ -336,8 +353,16 @@ def _run_launcher_loop() -> None:
                 subprocess.check_call([sys.executable, "-m", "runtime.cli", "update"])
             except subprocess.CalledProcessError as exc:
                 click.echo(f"Update failed (exit {exc.returncode}).", err=True)
-            click.pause("\nPress any key to return to the menu… ")
-            continue
+                click.pause("\nPress any key to return to the menu… ")
+                continue
+            # The running process still holds the OLD bytecode in memory;
+            # site-packages on disk has been replaced. Re-exec into the
+            # freshly installed launcher so the user lands back in the menu
+            # running the new code (matches the confirm dialog's promise
+            # that "xelos will exit and pip-upgrade").
+            click.echo("\nUpdate applied. Restarting xelos with the new build…")
+            os.execv(sys.executable, [sys.executable, "-m", "runtime.cli"])
+            return  # unreachable
 
 
 def _do_pair_interactive(*, code: str, api_base: str, force: bool) -> None:
