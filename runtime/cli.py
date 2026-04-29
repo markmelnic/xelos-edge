@@ -110,8 +110,19 @@ def pair_cmd(code: str, api_base: str, force: bool) -> None:
     is_flag=True,
     help="Log every WS frame sent/received (very chatty).",
 )
-def serve_cmd(log_frames: bool) -> None:
-    """Run the WebSocket daemon in the foreground."""
+@click.option(
+    "--no-tui",
+    is_flag=True,
+    help="Disable the interactive TUI (forces line-oriented logging).",
+)
+def serve_cmd(log_frames: bool, no_tui: bool) -> None:
+    """Run the WebSocket daemon in the foreground.
+
+    When stdout is a tty, launches an interactive Textual dashboard
+    (status / runs / files / logs panes). Pipe to a file or pass
+    --no-tui to fall back to plain log streaming for systemd, launchd,
+    etc.
+    """
     creds = Credentials.load()
     if creds is None:
         click.echo(
@@ -120,11 +131,38 @@ def serve_cmd(log_frames: bool) -> None:
         )
         sys.exit(2)
 
+    use_tui = (not no_tui) and sys.stdout.isatty()
+    if use_tui:
+        from .tui import run_tui
+
+        run_tui(credentials=creds, log_frames=log_frames)
+        return
+
     daemon = Daemon(creds, options=DaemonOptions(log_frames=log_frames))
     try:
         asyncio.run(daemon.run())
     except KeyboardInterrupt:
         pass
+
+
+@main.command("tui")
+@click.option(
+    "--log-frames",
+    is_flag=True,
+    help="Log every WS frame sent/received (very chatty).",
+)
+def tui_cmd(log_frames: bool) -> None:
+    """Always launch the interactive dashboard (no auto-fallback)."""
+    creds = Credentials.load()
+    if creds is None:
+        click.echo(
+            "No credentials. Run `xelos pair <code>` first.",
+            err=True,
+        )
+        sys.exit(2)
+    from .tui import run_tui
+
+    run_tui(credentials=creds, log_frames=log_frames)
 
 
 @main.command("status")

@@ -18,6 +18,8 @@ dependencies = [
     "platformdirs>=4.2",
     "watchdog>=4.0",
     "mcp>=1.0",
+    "textual>=0.80",
+    "rich>=13.7",
 ]
 
 [project.optional-dependencies]

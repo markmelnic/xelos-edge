@@ -25,6 +25,7 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from .capabilities import detect as detect_capabilities
 from .config import Credentials
+from .events import EVENTS
 from .fingerprint import short_host
 from .fs_mirror import FsMirror
 from .hydrate import fetch_manifest
@@ -49,6 +50,8 @@ INLINE_PUSH_BYTES_MAX = 768 * 1024
 @dataclass(slots=True)
 class DaemonOptions:
     log_frames: bool = False
+    # When false, the host (e.g. the Textual TUI) owns SIGINT/SIGTERM.
+    install_signal_handlers: bool = True
 
 
 class Daemon:
@@ -70,7 +73,14 @@ class Daemon:
         self._hydrated_once = False
 
     async def run(self) -> None:
-        self._install_signal_handlers()
+        if self.options.install_signal_handlers:
+            self._install_signal_handlers()
+        EVENTS.publish(
+            "daemon.started",
+            device_id=str(self.credentials.device_id),
+            organization_id=str(self.credentials.organization_id),
+            api_base=self.credentials.api_base,
+        )
 
         backoff = RECONNECT_INITIAL_SECONDS
         while not self._stop.is_set():
@@ -81,8 +91,10 @@ class Daemon:
                 raise
             except (ConnectionClosed, OSError, InvalidStatus) as exc:
                 log.warning("ws disconnected: %s", exc)
-            except Exception:
+                EVENTS.publish("ws.disconnected", reason=str(exc))
+            except Exception as exc:
                 log.exception("ws session crashed")
+                EVENTS.publish("ws.disconnected", reason=f"crash:{type(exc).__name__}")
 
             if self._stop.is_set():
                 break
@@ -102,6 +114,7 @@ class Daemon:
     async def _session(self) -> None:
         url = self._authed_ws_url()
         log.info("connecting to %s", _redact_token(url))
+        EVENTS.publish("ws.connecting", url=_redact_token(url))
         async with websockets.connect(
             url,
             open_timeout=10,
@@ -112,6 +125,7 @@ class Daemon:
         ) as ws:
             self._ws = ws
             log.info("ws connected")
+            EVENTS.publish("ws.connected", url=_redact_token(url))
 
             await self._send(
                 ws,
@@ -179,6 +193,15 @@ class Daemon:
             await self._handle_fs_conflict(frame)
             return
         if ftype == "job.start":
+            EVENTS.publish(
+                "run.dispatch",
+                run_id=frame.get("run_id"),
+                agent_name=(frame.get("agent") or {}).get("name"),
+                agent_slug=(frame.get("agent") or {}).get("slug"),
+                department_slug=frame.get("department_slug"),
+                installed_skills=frame.get("installed_skills") or [],
+                installed_plugins=frame.get("installed_plugins") or [],
+            )
             supervisor = await self._ensure_supervisor()
             if supervisor is not None:
                 await supervisor.start(frame)
@@ -230,8 +253,19 @@ class Daemon:
                     summary.errors,
                     summary.in_sync,
                 )
-            except Exception:
+                EVENTS.publish(
+                    "reconcile.completed",
+                    pulled=summary.pulled,
+                    pushed=summary.pushed + summary.pushed_new,
+                    deleted_local=summary.deleted_local,
+                    deleted_remote=summary.deleted_remote,
+                    conflicts=summary.conflicts,
+                    errors=summary.errors,
+                    in_sync=summary.in_sync,
+                )
+            except Exception as exc:
                 log.exception("reconcile failed")
+                EVENTS.publish("reconcile.failed", error=str(exc))
                 return
 
         await self._ensure_watcher()
@@ -307,6 +341,14 @@ class Daemon:
             if self._watcher is not None:
                 self._watcher.suppress(str(outcome.abs_path))
             log.info("fs.push applied: %s", rel)
+            EVENTS.publish(
+                "fs.pulled",
+                path=rel,
+                size=len(content),
+                scope=scope,
+                department_slug=dept,
+                agent_slug=agent,
+            )
         except Exception:
             log.exception("fs.push apply failed: %s", rel)
 
@@ -324,6 +366,13 @@ class Daemon:
             if target is not None and self._watcher is not None:
                 self._watcher.suppress(str(target))
             log.info("fs.delete applied: %s", frame["path"])
+            EVENTS.publish(
+                "fs.deleted_local",
+                path=frame.get("path"),
+                scope=frame.get("scope"),
+                department_slug=frame.get("department_slug"),
+                agent_slug=frame.get("agent_slug"),
+            )
         except Exception:
             log.exception("fs.delete failed: %s", frame.get("path"))
 
@@ -339,18 +388,30 @@ class Daemon:
         TERMINAL_FRAME_TYPES = {"run.completed", "run.failed", "run.awaiting_approval"}
 
         async def _send(frame: dict[str, Any]) -> None:
+            ftype = frame.get("type", "")
             # Before reporting the run terminal, flush any pending watcher
             # writes so CC's last file mutations land in the cloud BEFORE
             # the cloud finalises the run record. Otherwise a delegated
             # follow-up agent could read stale files.
-            if (
-                frame.get("type") in TERMINAL_FRAME_TYPES
-                and self._watcher is not None
-            ):
+            if ftype in TERMINAL_FRAME_TYPES and self._watcher is not None:
                 try:
                     await self._watcher.flush()
                 except Exception:
                     log.exception("watcher flush failed before terminal frame")
+
+            # Mirror run lifecycle to the local event bus so the TUI can
+            # render an "active runs" dashboard without round-tripping the
+            # cloud.
+            if ftype.startswith("run."):
+                kind = ftype[len("run."):]
+                EVENTS.publish(
+                    "run." + kind,
+                    run_id=frame.get("run_id"),
+                    data=frame.get("data") or {},
+                    error=frame.get("error"),
+                    files_modified=frame.get("files_modified") or [],
+                )
+
             current_ws = self._ws
             if current_ws is None:
                 # Cloud times the run out on its side.
@@ -398,6 +459,13 @@ class Daemon:
                     "agent_slug": resolved.agent_slug,
                     "path": resolved.rel_path,
                 },
+            )
+            EVENTS.publish(
+                "fs.deleted_remote",
+                path=resolved.rel_path,
+                scope=resolved.scope,
+                department_slug=resolved.department_slug,
+                agent_slug=resolved.agent_slug,
             )
             return
 
@@ -467,6 +535,14 @@ class Daemon:
             await self._send(ws, frame)
         except ConnectionClosed:
             return
+        EVENTS.publish(
+            "fs.pushed",
+            path=resolved.rel_path,
+            size=len(content),
+            scope=resolved.scope,
+            department_slug=resolved.department_slug,
+            agent_slug=resolved.agent_slug,
+        )
 
         st = event.abs_path.stat()
         self._state.upsert(
