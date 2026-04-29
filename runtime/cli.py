@@ -48,8 +48,9 @@ def main(ctx: click.Context, verbose: bool) -> None:
 @click.option(
     "--api",
     "api_base",
-    required=True,
-    help="Cloud API base URL, e.g. https://api.xelos.example.com",
+    default="https://xelos-api-production.up.railway.app",
+    show_default=True,
+    help="Cloud API base URL.",
 )
 @click.option(
     "--force",
@@ -114,7 +115,7 @@ def serve_cmd(log_frames: bool) -> None:
     creds = Credentials.load()
     if creds is None:
         click.echo(
-            "No credentials. Run `xelos pair <code> --api <url>` first.",
+            "No credentials. Run `xelos pair <code>` first.",
             err=True,
         )
         sys.exit(2)

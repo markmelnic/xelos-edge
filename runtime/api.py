@@ -34,7 +34,11 @@ async def pair(
         body["public_key"] = public_key
 
     async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(f"{api_base.rstrip('/')}/devices/pair", json=body)
+        resp = await client.post(
+            f"{api_base.rstrip('/')}/devices/pair",
+            json=body,
+            headers={"X-Requested-With": "xelos-edge"},
+        )
     if resp.status_code >= 400:
         try:
             payload = resp.json()
