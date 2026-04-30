@@ -802,8 +802,27 @@ class Daemon:
         await ws.send(json.dumps(frame, default=str))
 
     def _authed_ws_url(self) -> str:
-        sep = "&" if "?" in self.credentials.websocket_url else "?"
-        return f"{self.credentials.websocket_url}{sep}token={self.credentials.token}"
+        # Derive the WS URL from `api_base` rather than trusting the
+        # server-provided `websocket_url`. The cloud builds that field
+        # from its own `API_BASE_URL` env, which on a local dev backend
+        # is often left unset → the daemon ends up dialing production
+        # forever despite `api_base` pointing at localhost. Rebuilding
+        # locally keeps the two values in lockstep with whatever the
+        # operator paired against.
+        api_base = (self.credentials.api_base or "").rstrip("/")
+        if api_base.startswith("https://"):
+            ws_base = "wss://" + api_base[len("https://"):]
+        elif api_base.startswith("http://"):
+            ws_base = "ws://" + api_base[len("http://"):]
+        else:
+            # Already a ws(s) scheme or something unparseable — fall
+            # back to whatever the credentials file shipped.
+            ws_base = self.credentials.websocket_url.rsplit(
+                "/devices/", 1
+            )[0]
+        url = f"{ws_base}/devices/{self.credentials.device_id}/ws"
+        sep = "&" if "?" in url else "?"
+        return f"{url}{sep}token={self.credentials.token}"
 
     def _install_signal_handlers(self) -> None:
         loop = asyncio.get_running_loop()

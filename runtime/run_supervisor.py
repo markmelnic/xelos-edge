@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -118,10 +119,29 @@ class RunSupervisor:
                     else None
                 )
                 if exit_code not in (0, None):
+                    # Surface stderr tail in the failure message so cloud
+                    # + UI know *why* claude died — opaque exit codes are
+                    # useless when debugging missing auth, bad MCP config,
+                    # rate limits, etc.
+                    stderr_tail = proc.stderr_tail.strip()
+                    err = f"claude_exit_code_{exit_code}"
+                    if stderr_tail:
+                        # Trim the joined tail so the WS frame stays
+                        # under the 8KB-ish soft cap that downstream log
+                        # rendering assumes.
+                        if len(stderr_tail) > 4000:
+                            stderr_tail = stderr_tail[-4000:]
+                        err = f"{err}: {stderr_tail}"
+                    log.warning(
+                        "claude exited %s for run %s. stderr tail:\n%s",
+                        exit_code,
+                        run_id,
+                        stderr_tail or "(empty)",
+                    )
                     await self._send_terminal(
                         run_id,
                         kind="failed",
-                        error=f"claude_exit_code_{exit_code}",
+                        error=err,
                         usage=proc.final_usage,
                         external_session_id=proc.session_id,
                         files_modified=files_modified,
@@ -167,13 +187,11 @@ class RunSupervisor:
         if not (workspace_slug and dept_slug and agent_slug):
             return None
 
-        cwd = (
-            org_root(workspace_slug)
-            / "departments"
-            / dept_slug
-            / "agents"
-            / agent_slug
-        )
+        # Workspace-rooted layout (matches `fs_mirror::_resolve_target`):
+        # `{ws}/{dept}/{agent}`. The legacy `departments/<X>/agents/<Y>`
+        # tree is migrated in-place at FsMirror init, so this is the only
+        # path that exists for active mirrors.
+        cwd = org_root(workspace_slug) / dept_slug / agent_slug
         max_turns = max(1, int(agent.get("max_steps") or 20))
         mcp_config_path = self._write_mcp_config(run_id)
 
@@ -182,22 +200,60 @@ class RunSupervisor:
         for slug in frame.get("xelos_tools") or []:
             cc_allowed.append(f"mcp__xelos__{slug}")
 
+        # Claude rejects an empty positional arg with `--print` so
+        # always ship a non-empty user_message. Cloud should already do
+        # this (`_build_user_message` synthesises a placeholder), but
+        # belt-and-suspenders here keeps a malformed frame from
+        # crashing the subprocess with the unhelpful "Input must be
+        # provided…" stderr line.
+        user_msg = (frame.get("user_message") or "").strip()
+        if not user_msg:
+            user_msg = "(no instruction provided — continue from prior context)"
+            log.warning(
+                "job.start frame for run %s carried empty user_message; "
+                "substituting placeholder",
+                run_id,
+            )
+
+        # Cloud passes the prior run's CC session id so we can `--resume`
+        # — keeps multi-turn dispatcher conversations coherent. Null
+        # when this is the agent's first run.
+        resume_session_id = frame.get("resume_session_id")
+        if not isinstance(resume_session_id, str) or not resume_session_id:
+            resume_session_id = None
+
         return JobSpec(
             run_id=run_id,
             working_directory=cwd,
             system_prompt=frame.get("system_prompt") or "",
-            user_message=frame.get("user_message") or "",
+            user_message=user_msg,
             allowed_tools=cc_allowed,
             max_turns=max_turns,
             mcp_config_path=mcp_config_path,
+            resume_session_id=resume_session_id,
         )
 
     def _write_mcp_config(self, run_id: str) -> Path | None:
-        """One-off `~/.xelos/runs/<id>.mcp.json` pointing CC at xelos-mcp."""
+        """One-off `~/.xelos/runs/<id>.mcp.json` pointing CC at xelos-mcp.
+
+        `xelos-mcp` ships from the same wheel as `xelos`, so it lives in
+        the daemon's own venv `bin/`. Production installers expose a
+        PATH shim for `xelos` but not always for `xelos-mcp`, so we
+        check `shutil.which` first and fall back to the sibling of
+        `sys.executable`. Without this fallback a Foreman / Workspace
+        Dispatcher loses every cloud tool (`create_department`,
+        `delegate_to_agent`, etc.) and surfaces as "tools missing".
+        """
         binary = shutil.which("xelos-mcp")
         if binary is None:
+            sibling = Path(sys.executable).parent / "xelos-mcp"
+            if sibling.exists() and os.access(sibling, os.X_OK):
+                binary = str(sibling)
+        if binary is None:
             log.warning(
-                "xelos-mcp not on PATH; agent will run with native CC tools only"
+                "xelos-mcp not found on PATH or alongside %s; "
+                "agent will run with native CC tools only",
+                sys.executable,
             )
             return None
 

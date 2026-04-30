@@ -24,10 +24,49 @@ from .updates import maybe_warn_outdated, refresh_cache as refresh_update_cache
 
 
 def _setup_logging(verbose: bool) -> None:
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
+    """Console + persistent file logging.
+
+    Console handler is the human-facing stream the operator sees while
+    Serve runs. Textual's TUI takes over the terminal in that mode and
+    makes scrollback un-selectable, so we ALWAYS mirror the same lines
+    to `~/.xelos/serve.log` — copy / grep-friendly, survives across
+    daemon restarts, and includes Claude Code's stderr after the fix.
+    """
+    level = logging.DEBUG if verbose else logging.INFO
+    fmt = logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s :: %(message)s"
     )
+    root = logging.getLogger()
+    # Remove pre-existing handlers (re-entry from `os.execv` after update,
+    # tests, etc.) so we don't double-log.
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    root.setLevel(level)
+
+    stream = logging.StreamHandler()
+    stream.setFormatter(fmt)
+    root.addHandler(stream)
+
+    try:
+        from .config import _xelos_home
+
+        log_path = _xelos_home() / "serve.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Rotating to keep disk usage bounded — 5MB × 5 = 25MB ceiling.
+        from logging.handlers import RotatingFileHandler
+
+        file_handler = RotatingFileHandler(
+            str(log_path),
+            maxBytes=5 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(fmt)
+        root.addHandler(file_handler)
+    except Exception:  # pragma: no cover
+        # Never let logging setup take down the daemon — the console
+        # handler is enough on its own.
+        pass
 
 
 @click.group(invoke_without_command=True)
@@ -101,6 +140,37 @@ def pair_cmd(code: str, api_base: str | None, force: bool) -> None:
         sys.exit(2)
     resolved_api = api_base or _default_api_base()
     _do_pair_interactive(code=code, api_base=resolved_api, force=force)
+
+
+@main.command("logs")
+@click.option("-f", "--follow", is_flag=True, help="tail -f the log file")
+@click.option("-n", "--lines", default=200, show_default=True)
+def logs_cmd(follow: bool, lines: int) -> None:
+    """Print the rolling daemon log (`~/.xelos/serve.log`).
+
+    Useful when Serve's Textual TUI grabs the terminal and prevents
+    selection — open another shell and run `xelos logs -f` to copy /
+    grep / share without quitting the daemon.
+    """
+    from .config import _xelos_home
+
+    path = _xelos_home() / "serve.log"
+    if not path.exists():
+        click.echo(
+            f"No log file yet at {path}. Run `xelos serve` first.",
+            err=True,
+        )
+        sys.exit(2)
+    if follow:
+        # Defer to system `tail -F` for a robust follow with rotation
+        # support. Falls back to reading once if `tail` isn't on PATH.
+        tail = shutil.which("tail")
+        if tail:
+            os.execv(tail, [tail, "-n", str(lines), "-F", str(path)])
+        click.echo("`tail` not found; printing last lines and exiting.", err=True)
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        content = f.read().splitlines()[-lines:]
+        click.echo("\n".join(content))
 
 
 @main.command("pair-local", hidden=True)
@@ -445,9 +515,25 @@ def _do_pair_interactive(*, code: str, api_base: str, force: bool) -> None:
         click.echo(f"Pair failed: {exc}", err=True)
         return
 
+    # Derive the WS URL from the api base the operator actually paired
+    # against — the server-provided `websocket_url` is built from the
+    # cloud's `API_BASE_URL` env which a local dev backend often leaves
+    # set to production. Daemon `_authed_ws_url` rebuilds at connect
+    # time too, but we persist the derived value so `xelos status`
+    # reflects reality and existing creds files self-correct on next
+    # pair.
+    api_base_clean = api_base.rstrip("/")
+    if api_base_clean.startswith("https://"):
+        ws_scheme_url = "wss://" + api_base_clean[len("https://"):]
+    elif api_base_clean.startswith("http://"):
+        ws_scheme_url = "ws://" + api_base_clean[len("http://"):]
+    else:
+        ws_scheme_url = result["websocket_url"].rsplit("/devices/", 1)[0]
+    derived_ws = f"{ws_scheme_url}/devices/{result['device_id']}/ws"
+
     creds = Credentials(
-        api_base=api_base.rstrip("/"),
-        websocket_url=result["websocket_url"],
+        api_base=api_base_clean,
+        websocket_url=derived_ws,
         device_id=result["device_id"],
         user_id=result["user_id"],
         token=result["token"],
