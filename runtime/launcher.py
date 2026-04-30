@@ -24,7 +24,23 @@ from .capabilities import detect as detect_capabilities
 from .config import Credentials, credentials_path
 
 
-_DEFAULT_API = "https://xelos-api-production.up.railway.app"
+# Default API base shown in the interactive pair prompt. Honours
+# `XELOS_API_BASE` (full URL override) and `XELOS_DEV=1` (shorthand for
+# localhost:8000) so a developer can launch the daemon against a local
+# backend without having to remember the flag.
+import os as _os
+
+
+def _default_api() -> str:
+    explicit = (_os.environ.get("XELOS_API_BASE") or "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    if _os.environ.get("XELOS_DEV") in ("1", "true", "yes"):
+        return "http://localhost:8000"
+    return "https://xelos-api-production.up.railway.app"
+
+
+_DEFAULT_API = _default_api()
 
 # ANSI palette — lavender accent matches xelos-www brand (#beafe7 ≈ 256-color 183).
 _BOLD = "\033[1m"

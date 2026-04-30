@@ -54,28 +54,76 @@ def main(ctx: click.Context, verbose: bool) -> None:
         _run_launcher_loop()
 
 
+_PROD_API_BASE = "https://xelos-api-production.up.railway.app"
+_LOCAL_API_BASE = "http://localhost:8000"
+
+
+def _default_api_base() -> str:
+    """API base URL the CLI + launcher start with.
+
+    Order of precedence:
+      1. `XELOS_API_BASE` env var (full URL) — the primary mechanism for
+         pointing edge at a non-prod backend (local dev, staging, etc.).
+      2. `XELOS_DEV=1` env var — shorthand for `localhost:8000`.
+      3. Production cloud — the safe default for end users.
+    """
+    explicit = (os.environ.get("XELOS_API_BASE") or "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    if os.environ.get("XELOS_DEV") in ("1", "true", "yes"):
+        return _LOCAL_API_BASE
+    return _PROD_API_BASE
+
+
 @main.command("pair")
 @click.argument("code")
 @click.option(
     "--api",
     "api_base",
-    default="https://xelos-api-production.up.railway.app",
-    show_default=True,
-    help="Cloud API base URL.",
+    default=None,
+    show_default=False,
+    help=(
+        "Cloud API base URL. Defaults to $XELOS_API_BASE, then "
+        "localhost:8000 when $XELOS_DEV=1, then production."
+    ),
 )
 @click.option(
     "--force",
     is_flag=True,
     help="Overwrite existing credentials without prompting.",
 )
-def pair_cmd(code: str, api_base: str, force: bool) -> None:
+def pair_cmd(code: str, api_base: str | None, force: bool) -> None:
     """Redeem a pair code and write credentials."""
     if Credentials.load() is not None and not force:
         click.echo(
             "Already paired. Re-run with --force to replace.", err=True
         )
         sys.exit(2)
-    _do_pair_interactive(code=code, api_base=api_base, force=force)
+    resolved_api = api_base or _default_api_base()
+    _do_pair_interactive(code=code, api_base=resolved_api, force=force)
+
+
+@main.command("pair-local", hidden=True)
+@click.argument("code")
+@click.option(
+    "--port", default=8000, show_default=True, help="Local backend port."
+)
+@click.option("--force", is_flag=True)
+def pair_local_cmd(code: str, port: int, force: bool) -> None:
+    """Hidden dev convenience — pair against http://localhost:<port>.
+
+    Equivalent to `XELOS_API_BASE=http://localhost:8000 xelos pair CODE`
+    but discoverable enough to type from muscle memory during local
+    development. Hidden from `xelos --help` so end users don't see it.
+    """
+    if Credentials.load() is not None and not force:
+        click.echo(
+            "Already paired. Re-run with --force to replace.", err=True
+        )
+        sys.exit(2)
+    _do_pair_interactive(
+        code=code, api_base=f"http://localhost:{port}", force=force
+    )
 
 
 @main.command("serve")
