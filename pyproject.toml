@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xelos-edge"
-version = "0.1.1"
+version = "0.1.2"
 description = "Xelos Edge daemon — runs agents on a paired local machine via Claude Code."
 readme = "README.md"
 requires-python = ">=3.11"
