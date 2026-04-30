@@ -148,7 +148,7 @@ def status_cmd() -> None:
         click.echo("Not paired.")
     else:
         click.echo(f"Paired with device {creds.device_id}")
-        click.echo(f"  workspace_id = {creds.workspace_id}")
+        click.echo(f"  user_id      = {creds.user_id}")
         click.echo(f"  api_base        = {creds.api_base}")
         click.echo(f"  websocket_url   = {creds.websocket_url}")
     click.echo("Capabilities:")
@@ -401,7 +401,7 @@ def _do_pair_interactive(*, code: str, api_base: str, force: bool) -> None:
         api_base=api_base.rstrip("/"),
         websocket_url=result["websocket_url"],
         device_id=result["device_id"],
-        workspace_id=result["workspace_id"],
+        user_id=result["user_id"],
         token=result["token"],
     )
     creds.save()

@@ -237,7 +237,7 @@ def _show_status(creds: Credentials | None) -> None:
     else:
         rows = [
             ("device_id", str(creds.device_id)),
-            ("workspace_id", str(creds.workspace_id)),
+            ("user_id", str(creds.user_id)),
             ("api_base", creds.api_base),
             ("ws_url", creds.websocket_url),
             ("credentials", str(credentials_path())),

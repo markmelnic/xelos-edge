@@ -191,10 +191,10 @@ class HeaderBar(Static):
 
     ws_state: reactive[str] = reactive("connecting")
 
-    def __init__(self, *, device_id: str, workspace_id: str) -> None:
+    def __init__(self, *, device_id: str, user_id: str) -> None:
         super().__init__(id="header")
         self._device_id = device_id
-        self._workspace_id = workspace_id
+        self._user_id = user_id
 
     def render(self) -> Text:
         ws_dot, ws_color = {
@@ -209,8 +209,8 @@ class HeaderBar(Static):
         text.append(f"   v{__version__}", style="#7d8a9a")
         text.append("    device ", style="#7d8a9a")
         text.append(_short(self._device_id, 12), style="#d8ccf0")
-        text.append("    org ", style="#7d8a9a")
-        text.append(_short(self._workspace_id, 12), style="#d8ccf0")
+        text.append("    user ", style="#7d8a9a")
+        text.append(_short(self._user_id, 12), style="#d8ccf0")
         text.append("    WS ", style="#7d8a9a")
         text.append(f"{ws_dot} {self.ws_state}", style=f"bold {ws_color}")
         return text
@@ -237,7 +237,7 @@ class StatusPane(VerticalScroll):
     def compose(self) -> ComposeResult:
         yield Label("Device", classes="section-title")
         yield Static(self._kv_text("Device id", self._creds.device_id))
-        yield Static(self._kv_text("Workspace", self._creds.workspace_id))
+        yield Static(self._kv_text("User", self._creds.user_id))
         yield Static(self._kv_text("API base", self._creds.api_base))
         yield Static(self._kv_text("Mirror root", self._mirror_root))
 
@@ -498,7 +498,7 @@ class XelosTUI(App):
     def compose(self) -> ComposeResult:
         yield HeaderBar(
             device_id=str(self._creds.device_id),
-            workspace_id=str(self._creds.workspace_id),
+            user_id=str(self._creds.user_id),
         )
         with TabbedContent(initial="tab-status", id="tabs"):
             with TabPane("Status", id="tab-status"):

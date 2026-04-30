@@ -82,7 +82,7 @@ class Daemon:
         EVENTS.publish(
             "daemon.started",
             device_id=str(self.credentials.device_id),
-            workspace_id=str(self.credentials.workspace_id),
+            user_id=str(self.credentials.user_id),
             api_base=self.credentials.api_base,
         )
 
@@ -93,7 +93,42 @@ class Daemon:
                 backoff = RECONNECT_INITIAL_SECONDS
             except asyncio.CancelledError:
                 raise
-            except (ConnectionClosed, OSError, InvalidStatus) as exc:
+            except ConnectionClosed as exc:
+                log.warning("ws disconnected: %s", exc)
+                EVENTS.publish("ws.disconnected", reason=str(exc))
+                # Permanent close: bad/expired token (1008) or device
+                # revoked / superseded (4003 / 4000). Reconnecting just
+                # spins the loop forever — surface the failure instead so
+                # the user can re-pair.
+                code = getattr(exc, "code", None) or getattr(
+                    getattr(exc, "rcvd", None), "code", None
+                )
+                if code in (1008, 4000, 4003):
+                    log.error(
+                        "credentials rejected by cloud (close code=%s). "
+                        "Stopping daemon — re-run `xelos pair <code>`.",
+                        code,
+                    )
+                    EVENTS.publish(
+                        "ws.auth_rejected", code=code, reason=str(exc)
+                    )
+                    break
+            except InvalidStatus as exc:
+                # Cloud refused the WS upgrade. 401/403 → bad token.
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                log.warning("ws upgrade rejected: %s (status=%s)", exc, status)
+                EVENTS.publish(
+                    "ws.disconnected", reason=f"upgrade:{status or 'unknown'}"
+                )
+                if status in (401, 403):
+                    log.error(
+                        "credentials rejected by cloud (HTTP %s). "
+                        "Stopping daemon — re-run `xelos pair <code>`.",
+                        status,
+                    )
+                    EVENTS.publish("ws.auth_rejected", code=status)
+                    break
+            except OSError as exc:
                 log.warning("ws disconnected: %s", exc)
                 EVENTS.publish("ws.disconnected", reason=str(exc))
             except Exception as exc:
