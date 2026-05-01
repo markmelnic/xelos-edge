@@ -83,15 +83,13 @@ async def reconcile_with_cloud(
         summary.errors += 1
         return summary
 
-    # Multi-org manifests carry `workspace_slug` per entry; filter to
-    # the entries belonging to this mirror's workspace. Legacy manifests
-    # (no per-entry slug) are accepted only when the top-level slug
-    # matches.
-    legacy_top_slug = manifest.get("workspace_slug")
-    if legacy_top_slug and legacy_top_slug != mirror.workspace_slug:
+    # Manifests carry `workspace_slug` per entry; filter to entries
+    # belonging to this mirror. Top-level slug (if present) must match.
+    top_slug = manifest.get("workspace_slug")
+    if top_slug and top_slug != mirror.workspace_slug:
         log.error(
             "workspace_slug mismatch (manifest=%s, mirror=%s) — aborting",
-            legacy_top_slug,
+            top_slug,
             mirror.workspace_slug,
         )
         summary.errors += 1
@@ -100,7 +98,7 @@ async def reconcile_with_cloud(
     manifest_by_path: dict[str, dict[str, Any]] = {}
     folders: list[dict[str, Any]] = []
     for entry in manifest.get("entries", []):
-        entry_slug = entry.get("workspace_slug") or legacy_top_slug
+        entry_slug = entry.get("workspace_slug") or top_slug
         if entry_slug and entry_slug != mirror.workspace_slug:
             continue
         kind = entry.get("kind")
@@ -160,9 +158,7 @@ async def reconcile_with_cloud(
                     state.delete(abs_path)
                     continue
                 # `workspace_slug` is mandatory upstream — `apply_device_delete`
-                # rejects frames without it. The watcher path supplies it; the
-                # reconcile path used to omit it, so pushed deletes silently
-                # never landed.
+                # rejects frames without it.
                 await send(
                     {
                         "type": "fs.delete",

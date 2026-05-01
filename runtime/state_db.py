@@ -61,10 +61,8 @@ class StateDB:
         return conn
 
     def _init_schema(self) -> None:
-        # `executescript` implicitly commits any pending transaction, so it
-        # cannot run inside our manual BEGIN/COMMIT wrapper (Python 3.14
-        # raises "cannot commit - no transaction is active" otherwise).
-        # Schema statements are all `IF NOT EXISTS`, so autocommit is safe.
+        # `executescript` implicitly commits, so it can't run inside our
+        # manual BEGIN/COMMIT wrapper (Python 3.14 raises otherwise).
         with self._lock:
             conn = self._connect()
             try:

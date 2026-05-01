@@ -74,7 +74,7 @@ class Daemon:
         self._runs: RunSupervisor | None = None
         self._hydrate_lock = asyncio.Lock()
         self._hydrated_once = False
-        self._known_orgs: list[dict[str, Any]] = []
+        self._known_workspaces: list[dict[str, Any]] = []
 
     async def run(self) -> None:
         if self.options.install_signal_handlers:
@@ -252,7 +252,7 @@ class Daemon:
         log.debug("unknown frame type=%s — ignoring", ftype)
 
     async def _on_ready(self) -> None:
-        """Reconcile every connect; runs once per known org workspace."""
+        """Reconcile every connect; runs once per known workspace workspace."""
         async with self._hydrate_lock:
             primer = await self._ensure_mirror()
             if primer is None:
@@ -271,8 +271,8 @@ class Daemon:
                 if self._watcher is not None:
                     self._watcher.suppress(path)
 
-            # Run reconcile once per org we know about; the manifest is
-            # multi-org but each mirror filters to its own slug.
+            # Run reconcile once per workspace we know about; the manifest is
+            # multi-workspace but each mirror filters to its own slug.
             mirrors_snapshot = list(self._mirrors.values())
             for mirror in mirrors_snapshot:
                 try:
@@ -321,7 +321,7 @@ class Daemon:
         await self._ensure_watcher()
 
     def _mirror_for_path(self, abs_path: Any) -> FsMirror | None:
-        """Resolve an absolute path back to its owning org mirror.
+        """Resolve an absolute path back to its owning workspace mirror.
 
         Layout is `~/.xelos/mirror/<workspace_slug>/...`. Walks every active
         mirror and returns whichever one contains `abs_path`.
@@ -345,9 +345,8 @@ class Daemon:
     ) -> FsMirror | None:
         """Get or lazily create the FsMirror for `workspace_slug`.
 
-        When called without `workspace_slug`, fetches the manifest, primes one
-        mirror per org listed there, and returns the first one (legacy
-        callers expect a single mirror back).
+        When called without a slug, fetches the manifest, primes one
+        mirror per workspace it lists, and returns the first one.
         """
         if workspace_slug:
             mirror = self._mirrors.get(workspace_slug)
@@ -361,17 +360,17 @@ class Daemon:
         except Exception:
             log.exception("manifest fetch failed in mirror init")
             return None
-        orgs = manifest.get("workspaces") or []
-        if not orgs:
-            # Legacy single-org manifest payload.
+        workspaces = manifest.get("workspaces") or []
+        if not workspaces:
+            # Legacy single-workspace manifest payload.
             single = manifest.get("workspace_slug")
             if single:
-                orgs = [{"slug": single}]
-        if not orgs:
+                workspaces = [{"slug": single}]
+        if not workspaces:
             return None
-        self._known_orgs = orgs
+        self._known_workspaces = workspaces
         first: FsMirror | None = None
-        for o in orgs:
+        for o in workspaces:
             slug = o.get("slug")
             if not isinstance(slug, str) or not slug:
                 continue
@@ -542,14 +541,14 @@ class Daemon:
     async def _ensure_watcher(self) -> None:
         if self._watcher is not None:
             return
-        # Multi-org devices: watch the umbrella `~/.xelos/mirror` root,
-        # not just one org subdir. `_on_local_change` derives the org
+        # Multi-workspace devices: watch the umbrella `~/.xelos/mirror` root,
+        # not just one workspace subdir. `_on_local_change` derives the workspace
         # from the changed path's first segment.
         mirror = await self._ensure_mirror()
         if mirror is None:
             return
         # mirror.root → `~/.xelos/mirror/<workspace_slug>`; one level up is
-        # the multi-org root.
+        # the multi-workspace root.
         from pathlib import Path
 
         watcher_root = Path(mirror.root).parent
@@ -558,8 +557,8 @@ class Daemon:
         self._watcher = watcher
 
     async def _on_local_change(self, event: FsEvent) -> None:
-        # Derive the changed file's org from its first path segment
-        # under `~/.xelos/mirror/<workspace_slug>/...`. Multi-org devices have
+        # Derive the changed file's workspace from its first path segment
+        # under `~/.xelos/mirror/<workspace_slug>/...`. Multi-workspace devices have
         # any number of mirrors; pick the matching one.
         mirror = self._mirror_for_path(event.abs_path)
         if mirror is None:

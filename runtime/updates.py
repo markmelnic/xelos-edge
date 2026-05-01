@@ -1,15 +1,4 @@
-"""Outdated-version notifier. Best-effort, silent on failure.
-
-We don't publish GitHub Releases — pip-installs target `@main` directly. So
-freshness is "is there a commit on main newer than what's installed?".
-We track the SHA we installed against in `update-check.json`. Cache layout:
-
-    {"installed_sha": "<short>", "latest_sha": "<short>", "checked_at": <ts>}
-
-`refresh_cache()` (called after `xelos update`) records the new HEAD SHA as
-both the installed and latest SHA. Subsequent runs only re-fetch latest and
-warn when it diverges from installed.
-"""
+"""Outdated-version notifier. Compares installed vs latest `main` SHA."""
 
 from __future__ import annotations
 
@@ -80,8 +69,7 @@ def maybe_warn_outdated(echo) -> None:
         latest_sha = _fetch_head_sha()
         if latest_sha is None:
             return
-        # First-ever check: pin the installed SHA to current HEAD so we don't
-        # nag on initial run. Updates after this point will be detected.
+        # First-ever check: pin installed=latest so we don't nag on initial run.
         if not installed_sha:
             installed_sha = latest_sha
         _write_cache(

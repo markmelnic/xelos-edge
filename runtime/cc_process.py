@@ -31,10 +31,8 @@ class JobSpec:
     max_turns: int = 20
     mcp_config_path: Path | None = None
     extra_args: list[str] = field(default_factory=list)
-    # Claude Code session id from the agent's prior run on this device.
-    # When set we shell out with `claude --resume <id>` so the dispatcher
-    # remembers the previous turn instead of treating each chat as a
-    # cold start.
+    # When set, shells out with `claude --resume <id>` so the prior
+    # session's history rehydrates instead of starting cold.
     resume_session_id: str | None = None
 
 
@@ -51,10 +49,8 @@ class ClaudeCodeProcess:
         self._session_id: str | None = None
         self._final_usage: dict[str, Any] = {}
         self._final_cost: float | None = None
-        # Bounded stderr buffer — surfaced in the terminal frame on a
-        # non-zero exit so cloud + UI see *why* claude died, not just
-        # `exit_code_1`. 80 lines covers any reasonable traceback while
-        # capping the WS frame size.
+        # Bounded stderr buffer surfaced in the terminal frame on non-zero
+        # exit so the failure reason is visible, not just `exit_code_1`.
         self._stderr_tail: deque[str] = deque(maxlen=80)
 
     @property
@@ -77,22 +73,14 @@ class ClaudeCodeProcess:
                 "`claude` CLI not found on PATH; install Claude Code first"
             )
 
-        # Hard-fail before spawn if there's nothing to send. Lets the
-        # caller produce a precise terminal frame (`empty_user_message`)
-        # instead of relying on claude's opaque "Input must be provided"
-        # stderr line.
+        # Hard-fail before spawn so the caller can emit a precise
+        # `empty_user_message` terminal frame.
         user_msg = (self.spec.user_message or "").strip()
         if not user_msg:
             raise ValueError("empty_user_message")
 
-        # Use the `--flag=value` form throughout for every option that
-        # takes a value. Claude Code's CLI parser is order-sensitive in
-        # subtle ways; observed failure mode is the trailing positional
-        # being eaten as the value of the *previous* flag (e.g.
-        # `--mcp-config <path> <user_msg>` resolves user_msg as the
-        # config path). The `=` form is unambiguous: each token is
-        # self-contained, the trailing token is unambiguously the
-        # positional prompt.
+        # `--flag=value` form throughout — Claude Code's CLI parser otherwise
+        # eats the trailing positional as the previous flag's value.
         sys_prompt = (self.spec.system_prompt or "").strip()
         args: list[str] = [
             binary,
@@ -108,22 +96,15 @@ class ClaudeCodeProcess:
         if self.spec.mcp_config_path is not None:
             args.append(f"--mcp-config={self.spec.mcp_config_path}")
         if self.spec.resume_session_id:
-            # `--resume <id>` rehydrates the prior CC session (full
-            # conversation history + tool results) from the local
-            # `~/.claude/projects/...` store. No-op if claude can't find
-            # the session — claude logs a warning and starts fresh.
             args.append(f"--resume={self.spec.resume_session_id}")
         args += self.spec.extra_args
-        # Positional prompt last — `--print` parses everything else as
-        # flags up to this point.
+        # Positional prompt must come last under `--print`.
         args.append(user_msg)
 
         cwd = str(self.spec.working_directory)
         os.makedirs(cwd, exist_ok=True)
 
-        # Truncate the user message in the spawn log so a 30KB prompt
-        # doesn't smother the daemon log. Full content remains in the
-        # cloud-side trigger_payload.
+        # Log message length only; full content lives in the cloud trigger_payload.
         log.info(
             "spawning claude code: cwd=%s tools=%s max_turns=%d "
             "user_msg_chars=%d sys_prompt_chars=%d mcp=%s",
@@ -134,9 +115,7 @@ class ClaudeCodeProcess:
             len(sys_prompt),
             self.spec.mcp_config_path,
         )
-        # Argv shown at INFO so a misparse like the `--mcp-config` /
-        # positional collision is one log scroll away. System prompt
-        # collapsed to length to keep the line short.
+        # System prompt collapsed to its length to keep the argv line short.
         redacted = [
             (
                 f"--append-system-prompt=<{len(sys_prompt)} chars>"
@@ -155,17 +134,12 @@ class ClaudeCodeProcess:
             stderr=asyncio.subprocess.PIPE,
         )
 
-        # Write the same prompt to stdin and close it. Done after spawn
-        # but before reading stdout so claude has the input by the time
-        # it starts producing the stream-json output.
+        # Write the prompt to stdin and close it before reading stdout.
         if self._proc.stdin is not None:
             try:
                 self._proc.stdin.write(user_msg.encode("utf-8"))
                 await self._proc.stdin.drain()
             except (BrokenPipeError, ConnectionResetError) as exc:
-                # Subprocess died before we finished writing — nothing
-                # we can do; fall through and let stdout/wait surface
-                # the exit code with stderr context.
                 log.warning("stdin write to claude failed: %s", exc)
             finally:
                 try:
@@ -220,17 +194,12 @@ class ClaudeCodeProcess:
             text = raw.decode("utf-8", errors="replace").rstrip()
             if not text:
                 continue
-            # Always emit at INFO so file/journal logs include the line —
-            # `--verbose` daemon flag bumps the parent logger anyway, but
-            # plain users still need to see why claude died. Buffer for
-            # the terminal frame too.
             log.info("claude stderr: %s", text)
             self._stderr_tail.append(text)
 
     @property
     def stderr_tail(self) -> str:
-        """Last N lines of claude stderr, newline-joined. Empty when
-        the subprocess exited cleanly with nothing on stderr."""
+        """Last N lines of claude stderr, newline-joined."""
         return "\n".join(self._stderr_tail)
 
     async def _translate(
@@ -322,5 +291,4 @@ class ClaudeCodeProcess:
                 )
             return
 
-        # Forward unknown events verbatim — nothing silently dropped.
         yield StepEvent(type="cc_raw", data={"event": event})

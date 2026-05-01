@@ -15,7 +15,7 @@ from typing import Any, Awaitable, Callable
 
 from .cc_process import ClaudeCodeProcess, ClaudeNotFound, JobSpec, StepEvent
 from .config import _xelos_home
-from .fs_mirror import org_root
+from .fs_mirror import workspace_root
 
 log = logging.getLogger(__name__)
 
@@ -187,11 +187,8 @@ class RunSupervisor:
         if not (workspace_slug and dept_slug and agent_slug):
             return None
 
-        # Workspace-rooted layout (matches `fs_mirror::_resolve_target`):
-        # `{ws}/{dept}/{agent}`. The legacy `departments/<X>/agents/<Y>`
-        # tree is migrated in-place at FsMirror init, so this is the only
-        # path that exists for active mirrors.
-        cwd = org_root(workspace_slug) / dept_slug / agent_slug
+        # Layout matches `fs_mirror._resolve_target`: `{ws}/{dept}/{agent}`.
+        cwd = workspace_root(workspace_slug) / dept_slug / agent_slug
         max_turns = max(1, int(agent.get("max_steps") or 20))
         mcp_config_path = self._write_mcp_config(run_id)
 
@@ -240,9 +237,9 @@ class RunSupervisor:
         the daemon's own venv `bin/`. Production installers expose a
         PATH shim for `xelos` but not always for `xelos-mcp`, so we
         check `shutil.which` first and fall back to the sibling of
-        `sys.executable`. Without this fallback a Foreman / Workspace
-        Dispatcher loses every cloud tool (`create_department`,
-        `delegate_to_agent`, etc.) and surfaces as "tools missing".
+        `sys.executable`. Without this fallback the Dispatcher loses
+        every cloud tool (`create_department`, `delegate_to_agent`,
+        etc.) and surfaces as "tools missing".
         """
         binary = shutil.which("xelos-mcp")
         if binary is None:

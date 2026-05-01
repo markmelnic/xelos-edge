@@ -87,12 +87,8 @@ class _Debounced(FileSystemEventHandler):
         asyncio.create_task(self._on_event(ev))
 
     async def flush(self) -> None:
-        """Fire all pending debounced events immediately and wait for them.
-
-        Used when a run is about to terminate — we don't want CC's last
-        writes to sit in the debounce window while the cloud thinks the
-        run already finished.
-        """
+        """Fire pending debounced events immediately. Used at run-end so CC's
+        final writes don't sit in the debounce window."""
         with self._lock:
             pending = list(self._pending.items())
             for abs_path, handle in pending:

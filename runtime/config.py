@@ -46,14 +46,8 @@ class Credentials:
                 data = json.load(f)
         except (json.JSONDecodeError, OSError):
             return None
-        # Migration: pre-user-scoped builds wrote a `workspace_id` key. The
-        # field is now `user_id` (devices belong to a user, not an org). Map
-        # the old key forward so already-paired daemons keep running until
-        # the next pair refreshes the file.
         if "user_id" not in data and "workspace_id" in data:
             data["user_id"] = data.pop("workspace_id")
-        # Drop unknown keys so a future-format credentials file doesn't break
-        # `cls(**data)`.
         allowed = {"api_base", "websocket_url", "device_id", "user_id", "token"}
         data = {k: v for k, v in data.items() if k in allowed}
         try:

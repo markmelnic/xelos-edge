@@ -26,19 +26,15 @@ from .updates import maybe_warn_outdated, refresh_cache as refresh_update_cache
 def _setup_logging(verbose: bool) -> None:
     """Console + persistent file logging.
 
-    Console handler is the human-facing stream the operator sees while
-    Serve runs. Textual's TUI takes over the terminal in that mode and
-    makes scrollback un-selectable, so we ALWAYS mirror the same lines
-    to `~/.xelos/serve.log` — copy / grep-friendly, survives across
-    daemon restarts, and includes Claude Code's stderr after the fix.
+    Always mirrors lines to `~/.xelos/serve.log` since the TUI grabs the
+    terminal during serve and makes scrollback unselectable.
     """
     level = logging.DEBUG if verbose else logging.INFO
     fmt = logging.Formatter(
         "%(asctime)s %(levelname)s %(name)s :: %(message)s"
     )
     root = logging.getLogger()
-    # Remove pre-existing handlers (re-entry from `os.execv` after update,
-    # tests, etc.) so we don't double-log.
+    # Drop pre-existing handlers so re-entry (e.g. post-update execv) doesn't double-log.
     for h in list(root.handlers):
         root.removeHandler(h)
     root.setLevel(level)
@@ -52,7 +48,7 @@ def _setup_logging(verbose: bool) -> None:
 
         log_path = _xelos_home() / "serve.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        # Rotating to keep disk usage bounded — 5MB × 5 = 25MB ceiling.
+        # 5MB × 5 = 25MB on-disk ceiling.
         from logging.handlers import RotatingFileHandler
 
         file_handler = RotatingFileHandler(
@@ -64,8 +60,6 @@ def _setup_logging(verbose: bool) -> None:
         file_handler.setFormatter(fmt)
         root.addHandler(file_handler)
     except Exception:  # pragma: no cover
-        # Never let logging setup take down the daemon — the console
-        # handler is enough on its own.
         pass
 
 
@@ -86,7 +80,6 @@ def main(ctx: click.Context, verbose: bool) -> None:
     if ctx.invoked_subcommand != "update":
         maybe_warn_outdated(click.echo)
     if ctx.invoked_subcommand is None:
-        # Bare `xelos` → interactive launcher (TTY only).
         if not sys.stdout.isatty():
             click.echo(ctx.get_help())
             return
@@ -98,14 +91,7 @@ _LOCAL_API_BASE = "http://localhost:8000"
 
 
 def _default_api_base() -> str:
-    """API base URL the CLI + launcher start with.
-
-    Order of precedence:
-      1. `XELOS_API_BASE` env var (full URL) — the primary mechanism for
-         pointing edge at a non-prod backend (local dev, staging, etc.).
-      2. `XELOS_DEV=1` env var — shorthand for `localhost:8000`.
-      3. Production cloud — the safe default for end users.
-    """
+    """API base URL: $XELOS_API_BASE → localhost when $XELOS_DEV=1 → prod."""
     explicit = (os.environ.get("XELOS_API_BASE") or "").strip()
     if explicit:
         return explicit.rstrip("/")
@@ -146,12 +132,7 @@ def pair_cmd(code: str, api_base: str | None, force: bool) -> None:
 @click.option("-f", "--follow", is_flag=True, help="tail -f the log file")
 @click.option("-n", "--lines", default=200, show_default=True)
 def logs_cmd(follow: bool, lines: int) -> None:
-    """Print the rolling daemon log (`~/.xelos/serve.log`).
-
-    Useful when Serve's Textual TUI grabs the terminal and prevents
-    selection — open another shell and run `xelos logs -f` to copy /
-    grep / share without quitting the daemon.
-    """
+    """Print the rolling daemon log (`~/.xelos/serve.log`)."""
     from .config import _xelos_home
 
     path = _xelos_home() / "serve.log"
@@ -162,8 +143,7 @@ def logs_cmd(follow: bool, lines: int) -> None:
         )
         sys.exit(2)
     if follow:
-        # Defer to system `tail -F` for a robust follow with rotation
-        # support. Falls back to reading once if `tail` isn't on PATH.
+        # Defer to system `tail -F` for rotation-aware follow.
         tail = shutil.which("tail")
         if tail:
             os.execv(tail, [tail, "-n", str(lines), "-F", str(path)])
@@ -180,12 +160,7 @@ def logs_cmd(follow: bool, lines: int) -> None:
 )
 @click.option("--force", is_flag=True)
 def pair_local_cmd(code: str, port: int, force: bool) -> None:
-    """Hidden dev convenience — pair against http://localhost:<port>.
-
-    Equivalent to `XELOS_API_BASE=http://localhost:8000 xelos pair CODE`
-    but discoverable enough to type from muscle memory during local
-    development. Hidden from `xelos --help` so end users don't see it.
-    """
+    """Hidden dev convenience — pair against http://localhost:<port>."""
     if Credentials.load() is not None and not force:
         click.echo(
             "Already paired. Re-run with --force to replace.", err=True
@@ -208,13 +183,7 @@ def pair_local_cmd(code: str, port: int, force: bool) -> None:
     help="Disable the interactive TUI (forces line-oriented logging).",
 )
 def serve_cmd(log_frames: bool, no_tui: bool) -> None:
-    """Run the WebSocket daemon in the foreground.
-
-    When stdout is a tty, launches an interactive Textual dashboard
-    (status / runs / files / logs panes). Pipe to a file or pass
-    --no-tui to fall back to plain log streaming for systemd, launchd,
-    etc.
-    """
+    """Run the WebSocket daemon in the foreground."""
     creds = Credentials.load()
     if creds is None:
         click.echo(
@@ -360,13 +329,8 @@ def update_cmd(ref: str | None, dry_run: bool) -> None:
             err=True,
         )
 
-    # `--force-reinstall --no-deps` is required: we ship from `@main` so the
-    # package version in pyproject.toml stays "0.1.0" even when the git SHA
-    # advances, and plain `--upgrade` would consider the install satisfied
-    # and skip overwriting site-packages. `--no-cache-dir` bypasses any
-    # cached wheel from a previous install of the same SHA. Deps don't
-    # change between SHAs in practice; rerun without `--no-deps` if you've
-    # added/removed a dependency.
+    # `--force-reinstall --no-deps` because we ship from `@main`: the pyproject
+    # version doesn't bump per SHA, so plain `--upgrade` is a no-op.
     cmd = [
         sys.executable,
         "-m",
@@ -428,10 +392,7 @@ def _format_api_error(exc: ApiError) -> str:
 
 
 def _run_launcher_loop() -> None:
-    """Drive the interactive menu. Each menu choice runs its action,
-    then returns here so the user can pick another. Exits when the user
-    explicitly quits.
-    """
+    """Drive the interactive menu until the user quits."""
     from .launcher import run_launcher
 
     while True:
@@ -465,19 +426,14 @@ def _run_launcher_loop() -> None:
             continue
 
         if result == "update":
-            # Defer to the existing update_cmd via subprocess so the
-            # in-process Click context isn't tangled with a self-upgrade.
+            # Defer to update_cmd via subprocess to avoid tangling Click context with self-upgrade.
             try:
                 subprocess.check_call([sys.executable, "-m", "runtime.cli", "update"])
             except subprocess.CalledProcessError as exc:
                 click.echo(f"Update failed (exit {exc.returncode}).", err=True)
                 click.pause("\nPress any key to return to the menu… ")
                 continue
-            # The running process still holds the OLD bytecode in memory;
-            # site-packages on disk has been replaced. Re-exec into the
-            # freshly installed launcher so the user lands back in the menu
-            # running the new code (matches the confirm dialog's promise
-            # that "xelos will exit and pip-upgrade").
+            # Re-exec so the user lands on the freshly installed code.
             click.echo("\nUpdate applied. Restarting xelos with the new build…")
             os.execv(sys.executable, [sys.executable, "-m", "runtime.cli"])
             return  # unreachable
@@ -515,13 +471,9 @@ def _do_pair_interactive(*, code: str, api_base: str, force: bool) -> None:
         click.echo(f"Pair failed: {exc}", err=True)
         return
 
-    # Derive the WS URL from the api base the operator actually paired
-    # against — the server-provided `websocket_url` is built from the
-    # cloud's `API_BASE_URL` env which a local dev backend often leaves
-    # set to production. Daemon `_authed_ws_url` rebuilds at connect
-    # time too, but we persist the derived value so `xelos status`
-    # reflects reality and existing creds files self-correct on next
-    # pair.
+    # Derive the WS URL from the api base the operator paired against —
+    # the server-provided `websocket_url` may point at the wrong host
+    # when a local dev backend has `API_BASE_URL` set to production.
     api_base_clean = api_base.rstrip("/")
     if api_base_clean.startswith("https://"):
         ws_scheme_url = "wss://" + api_base_clean[len("https://"):]

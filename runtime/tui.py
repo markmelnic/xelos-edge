@@ -1,12 +1,4 @@
-"""Textual TUI for `xelos serve`.
-
-Runs the daemon as a background asyncio task and renders a four-pane
-dashboard: Status / Runs / Files / Logs. Subscribes to `runtime.events`
-to drive real-time updates without polling the daemon.
-
-Color palette mirrors the xelos-www brand (lavender accent on near-black
-surfaces). Keybindings: `r/f/l/s` to switch panes, `q` to quit.
-"""
+"""Textual TUI for `xelos serve` — Status / Runs / Files / Logs panes."""
 
 from __future__ import annotations
 
@@ -187,7 +179,7 @@ def _fmt_clock(ts: float) -> str:
 
 
 class HeaderBar(Static):
-    """Shows brand + device id + org + ws state."""
+    """Shows brand + device id + workspace + ws state."""
 
     ws_state: reactive[str] = reactive("connecting")
 
@@ -401,7 +393,6 @@ class FilesPane(Vertical):
             _fmt_size(size) if size is not None else "—",
             key=key,
         )
-        # Keep the table tractable — drop oldest tracked key when capped.
         if len(self._row_keys) == self.MAX_ROWS:
             evict = self._row_keys.popleft()
             try:
@@ -524,7 +515,6 @@ class XelosTUI(App):
             if task is not None:
                 task.cancel()
         if self._daemon_task is not None:
-            # Daemon listens to its own SIGINT/SIGTERM handlers; we just cancel.
             self._daemon_task.cancel()
             try:
                 await self._daemon_task
@@ -544,13 +534,11 @@ class XelosTUI(App):
         bridge.setFormatter(
             logging.Formatter("%(name)s :: %(message)s")
         )
-        # Replace any existing root handlers — TUI owns the screen.
         root = logging.getLogger()
         for h in list(root.handlers):
             root.removeHandler(h)
         root.addHandler(bridge)
         root.setLevel(logging.INFO)
-        # Quiet down chatty third parties so the log pane stays readable.
         for noisy in ("httpx", "httpcore", "websockets"):
             logging.getLogger(noisy).setLevel(logging.WARNING)
 

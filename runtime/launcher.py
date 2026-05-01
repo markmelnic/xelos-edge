@@ -1,16 +1,4 @@
-"""Interactive launcher — `xelos` default entry.
-
-Keyboard-only line UI. No full-screen TUI, no mouse: prints a banner +
-numbered menu and reads single keypresses via termios (POSIX) / msvcrt
-(Windows). Arrow keys move the highlight; digits jump straight to an
-entry; Enter activates. Each redraw clears the viewport so successive
-key presses don't scroll the menu down the buffer.
-
-Returns one of:
-    None                                          quit
-    "serve" | "logout" | "update"                 simple action token
-    {"action": "pair", "code": ..., "api": ...}   pair flow values
-"""
+"""Interactive launcher — `xelos` default entry. Keyboard-only line UI."""
 
 from __future__ import annotations
 
@@ -24,10 +12,6 @@ from .capabilities import detect as detect_capabilities
 from .config import Credentials, credentials_path
 
 
-# Default API base shown in the interactive pair prompt. Honours
-# `XELOS_API_BASE` (full URL override) and `XELOS_DEV=1` (shorthand for
-# localhost:8000) so a developer can launch the daemon against a local
-# backend without having to remember the flag.
 import os as _os
 
 
@@ -42,7 +26,6 @@ def _default_api() -> str:
 
 _DEFAULT_API = _default_api()
 
-# ANSI palette — lavender accent matches xelos-www brand (#beafe7 ≈ 256-color 183).
 _BOLD = "\033[1m"
 _DIM = "\033[2m"
 _ACCENT = "\033[38;5;183m"
@@ -61,12 +44,7 @@ def _c(s: str, code: str) -> str:
 
 
 def _clear_screen() -> None:
-    """Wipe the viewport + park the cursor at row 1 col 1.
-
-    Uses `\x1b[H\x1b[2J` rather than `clear`/`cls` to avoid spawning a
-    subprocess on every keystroke. Falls back to a form-feed when ANSI
-    is unsupported (dumb terminals or piped stdout).
-    """
+    """Wipe the viewport + park the cursor at row 1 col 1."""
     if _supports_ansi():
         sys.stdout.write("\x1b[H\x1b[2J")
         sys.stdout.flush()
@@ -76,16 +54,7 @@ def _clear_screen() -> None:
 
 
 def _read_key() -> str:
-    """Read a normalised key name.
-
-    Returns one of:
-        "up" | "down" | "left" | "right"   arrows
-        "enter"                            CR / LF
-        "esc"                              standalone ESC
-        ""                                 EOF / unrecognised escape
-        single character                   any other printable key
-    Raises KeyboardInterrupt on Ctrl-C.
-    """
+    """Read a normalised key name. Raises KeyboardInterrupt on Ctrl-C."""
     if not sys.stdin.isatty():
         line = sys.stdin.readline()
         return line.strip()[:1]
@@ -116,10 +85,8 @@ def _read_key() -> str:
     import termios
     import tty
 
-    # Read raw bytes via `os.read(fd, ...)` rather than `sys.stdin.read`.
-    # The text wrapper's internal buffer hides follow-up bytes from
-    # `select()`, so a `\x1b[A` arrow burst would look like a lone ESC and
-    # the launcher would treat it as a quit.
+    # Use raw `os.read(fd, ...)`; the text wrapper's buffer hides follow-up
+    # bytes from `select()`, breaking arrow-key escape sequence detection.
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
@@ -130,9 +97,7 @@ def _read_key() -> str:
         if first in (b"\r", b"\n"):
             return "enter"
         if first == b"\x1b":
-            # CSI tail (`[A`/`[B`/`[C`/`[D`) lands within milliseconds; 150ms
-            # is generous even over latent SSH/PTY links and still feels
-            # instant when the user actually pressed plain Esc.
+            # 150ms is generous over SSH/PTY links and still feels instant for plain Esc.
             ready, _, _ = select.select([fd], [], [], 0.15)
             if not ready:
                 return "esc"
@@ -159,8 +124,8 @@ def _read_key() -> str:
 
 @dataclass(slots=True)
 class _MenuItem:
-    key: str        # digit / letter shortcut
-    action: str     # action id bubbled to the CLI
+    key: str
+    action: str
     label: str
     enabled: bool
 
@@ -330,12 +295,7 @@ def _press_any_key() -> None:
 
 
 def run_launcher() -> Any:
-    """Render the menu and dispatch a single user-chosen action.
-
-    Local actions (status, doctor, invalid keys) loop in-place and
-    redraw the menu. Actions that hand control back to the CLI (pair /
-    serve / update / logout / quit) bubble up via the return value.
-    """
+    """Render the menu and dispatch a single user-chosen action."""
     creds = Credentials.load()
     items = _menu_items(creds)
     selected = _initial_selection(items)
@@ -358,8 +318,7 @@ def run_launcher() -> Any:
             selected = _move(items, selected, 1)
             continue
 
-        # Number / letter shortcut: jump to that entry. If valid + enabled,
-        # treat as an immediate activation.
+        # Shortcut: jump to entry and immediately activate if enabled.
         if key and key not in {"enter", "esc", "left", "right"}:
             for i, it in enumerate(items):
                 if it.key == key.lower():
@@ -397,8 +356,7 @@ def run_launcher() -> Any:
             return result
 
 
-# Sentinel signalling "stay in the launcher loop" without conflating with
-# the legitimate `None` return that means "quit".
+# Sentinel for "stay in the launcher loop" — distinct from `None` (quit).
 class _Continue:
     __slots__ = ()
 
@@ -407,8 +365,7 @@ _CONTINUE = _Continue()
 
 
 def _activate(item: _MenuItem, creds: Credentials | None) -> Any:
-    """Run an item. Returns the value to bubble out of `run_launcher`,
-    or `_CONTINUE` to stay in the menu loop."""
+    """Run an item. Returns a bubble-up value or `_CONTINUE` to stay."""
     if item.action == "quit":
         return None
     if item.action == "pair":

@@ -42,7 +42,7 @@ def should_ignore(path: Path) -> bool:
 
 
 def resolve(*, root: Path, abs_path: Path) -> ResolvedPath | None:
-    """Returns None for paths outside the org root or known noise files."""
+    """Returns None for paths outside the workspace root or known noise files."""
     if should_ignore(abs_path):
         return None
     try:

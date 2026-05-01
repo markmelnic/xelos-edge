@@ -1,10 +1,4 @@
-"""Tiny in-process pub/sub for daemon → TUI plumbing.
-
-The daemon publishes structured events (ws state, runs, fs sync, errors)
-and any number of subscribers (currently: the TUI app) drain them via an
-asyncio.Queue. The bus is process-local, optional, and a no-op when
-nobody subscribes — daemon code calls `EVENTS.publish(...)` unconditionally.
-"""
+"""Tiny in-process pub/sub for daemon → TUI plumbing."""
 
 from __future__ import annotations
 
@@ -49,12 +43,11 @@ class EventBus:
         if not self._subs:
             return
         ev = Event(kind=kind, payload=dict(payload))
-        # Synchronous put_nowait — events are small dicts, drops are fine.
         for q in list(self._subs):
             try:
                 q.put_nowait(ev)
             except asyncio.QueueFull:
-                # Drop the oldest to make space; TUI shows recent state, not history.
+                # Drop oldest to make space; TUI shows recent state.
                 try:
                     q.get_nowait()
                     q.put_nowait(ev)
@@ -62,7 +55,6 @@ class EventBus:
                     pass
 
 
-# Module-level singleton used by daemon publishers.
 EVENTS = EventBus()
 
 

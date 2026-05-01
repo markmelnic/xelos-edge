@@ -32,7 +32,6 @@ def _setup_logging() -> None:
 
 
 def _to_text(payload: Any) -> str:
-    """Pretty-print structured tool output as MCP TextContent."""
     if isinstance(payload, str):
         return payload
     try:
