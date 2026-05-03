@@ -535,7 +535,9 @@ class Daemon:
                     frame.get("type"),
                 )
 
-        self._runs = RunSupervisor(send=_send, max_concurrent_runs=cap)
+        self._runs = RunSupervisor(
+            send=_send, state=self._state, max_concurrent_runs=cap
+        )
         return self._runs
 
     async def _ensure_watcher(self) -> None:

@@ -926,10 +926,79 @@ class XelosTUI(App):
 
     async def on_mount(self) -> None:
         self._install_log_bridge()
+        # Hydrate from local store BEFORE daemon starts streaming, so
+        # restart-after-restart shows continuous history rather than a
+        # blank canvas.
+        self._hydrate_from_state()
         self._daemon_task = asyncio.create_task(self._daemon.run())
         self._event_task = asyncio.create_task(self._drain_events())
         self._log_drain_task = asyncio.create_task(self._drain_log_buffer())
         self._tick_task = asyncio.create_task(self._tick_metrics())
+
+    def _hydrate_from_state(self) -> None:
+        state = getattr(self._daemon, "_state", None)
+        if state is None:
+            return
+        try:
+            recent = state.recent_runs(limit=100)
+        except Exception:  # pragma: no cover
+            log.exception("hydrate runs from state_db failed")
+            recent = []
+        if recent:
+            try:
+                runs_pane = self.query_one(RunsPane)
+                ws_pane = self.query_one(WorkspacesPane)
+            except Exception:
+                runs_pane = None
+                ws_pane = None
+            for r in recent:
+                if runs_pane is not None:
+                    runs_pane.upsert_run(
+                        run_id=r.run_id,
+                        agent_name=r.agent_name,
+                        department_slug=r.department_slug,
+                        status=r.status,
+                    )
+                if ws_pane is not None and r.workspace_slug:
+                    ws_pane.upsert(slug=r.workspace_slug)
+                # Bucket lifecycle counters from history so the
+                # ActivityCard isn't all zeros after a restart.
+                self._metrics.runs_dispatched += 1
+                if r.status == "completed":
+                    self._metrics.runs_completed += 1
+                elif r.status == "failed":
+                    self._metrics.runs_failed += 1
+                elif r.status in ("running", "queued"):
+                    # Mark as orphaned-running — daemon's reconnect will
+                    # re-emit terminal events when state is reconciled.
+                    self._metrics.runs_active += 1
+            try:
+                activity = self.query_one("#activity-card", ActivityCard)
+                activity.update_counters(
+                    dispatched=self._metrics.runs_dispatched,
+                    completed=self._metrics.runs_completed,
+                    failed=self._metrics.runs_failed,
+                    active=max(self._metrics.runs_active, 0),
+                )
+            except Exception:
+                pass
+
+        try:
+            recent_logs = state.recent_logs(limit=200)
+        except Exception:  # pragma: no cover
+            recent_logs = []
+        if recent_logs:
+            try:
+                logs_pane = self.query_one("#logs-pane", LogsPane)
+                status_pane = self.query_one("#status-pane", StatusPane)
+            except Exception:
+                logs_pane = None
+                status_pane = None
+            for rec in recent_logs:
+                if logs_pane is not None:
+                    logs_pane.append(rec.msg, level=rec.level)
+                if status_pane is not None:
+                    status_pane.append_log(rec.msg, level=rec.level)
 
     async def on_unmount(self) -> None:
         for task in (self._event_task, self._log_drain_task, self._tick_task):
@@ -964,6 +1033,7 @@ class XelosTUI(App):
             logging.getLogger(noisy).setLevel(logging.WARNING)
 
     async def _drain_log_buffer(self) -> None:
+        state = getattr(self._daemon, "_state", None)
         try:
             while True:
                 await asyncio.sleep(0.25)
@@ -979,6 +1049,12 @@ class XelosTUI(App):
                     pane.append(msg, level=level)
                     if status is not None:
                         status.append_log(msg, level=level)
+                    # Mirror to local store so a restart shows continuity.
+                    if state is not None:
+                        try:
+                            state.append_log(level, msg)
+                        except Exception:  # pragma: no cover
+                            pass
         except asyncio.CancelledError:
             return
 

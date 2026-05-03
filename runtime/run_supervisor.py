@@ -8,6 +8,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,7 @@ from typing import Any, Awaitable, Callable
 from .cc_process import ClaudeCodeProcess, ClaudeNotFound, JobSpec, StepEvent
 from .config import _xelos_home
 from .fs_mirror import workspace_root
+from .state_db import RunRecord, StateDB
 
 log = logging.getLogger(__name__)
 
@@ -28,9 +30,11 @@ class RunSupervisor:
         self,
         *,
         send: SendFn,
+        state: StateDB | None = None,
         max_concurrent_runs: int = 4,
     ) -> None:
         self._send = send
+        self._state = state
         self._sem = asyncio.Semaphore(max_concurrent_runs)
         self._active: dict[str, ClaudeCodeProcess] = {}
         self._lock = asyncio.Lock()
@@ -74,22 +78,31 @@ class RunSupervisor:
             async with self._lock:
                 self._active[run_id] = proc
 
+            agent = frame.get("agent") or {}
+            self._persist_dispatch(run_id, frame, agent)
+
             await self._send_event(
                 run_id,
                 StepEvent(
                     type="run.started",
                     data={
-                        "agent_id": frame.get("agent", {}).get("id"),
-                        "agent_name": frame.get("agent", {}).get("name"),
+                        "agent_id": agent.get("id"),
+                        "agent_name": agent.get("name"),
                         "executor": "device",
                         "working_directory": str(spec.working_directory),
                     },
                 ),
             )
 
+            # Drive a periodic `run.heartbeat` while CC is working so the cloud's
+            # device-quiet timer doesn't trip during long LLM calls or
+            # rate-limit backoffs (CC can stall multiple minutes silently).
+            hb_task = asyncio.create_task(self._heartbeat_loop(run_id))
+
             files_modified: list[str] = []
             try:
                 async for ev in proc.stream():
+                    self._persist_event(run_id, ev)
                     # Track file mutations so we can emit a summary step
                     # before terminal — gives the cloud audit timeline a
                     # canonical "what files changed" without parsing every
@@ -169,6 +182,11 @@ class RunSupervisor:
                     trace=traceback.format_exc(),
                 )
             finally:
+                hb_task.cancel()
+                try:
+                    await hb_task
+                except (asyncio.CancelledError, Exception):  # pragma: no cover
+                    pass
                 async with self._lock:
                     self._active.pop(run_id, None)
                 if spec.mcp_config_path is not None:
@@ -212,12 +230,23 @@ class RunSupervisor:
                 run_id,
             )
 
-        # Cloud passes the prior run's CC session id so we can `--resume`
-        # — keeps multi-turn dispatcher conversations coherent. Null
-        # when this is the agent's first run.
+        # Cloud passes the prior run's CC session id so we can `--resume`.
+        # If absent (cold cloud, lost frame, etc.) fall back to the local
+        # agent_session cache so multi-turn continuity survives a daemon
+        # restart even when the cloud doesn't carry the id.
         resume_session_id = frame.get("resume_session_id")
         if not isinstance(resume_session_id, str) or not resume_session_id:
             resume_session_id = None
+        if resume_session_id is None and self._state is not None:
+            agent_id = (frame.get("agent") or {}).get("id")
+            if agent_id:
+                resume_session_id = self._state.get_agent_session(agent_id)
+                if resume_session_id:
+                    log.info(
+                        "run %s: resuming agent session %s from local cache",
+                        run_id,
+                        resume_session_id,
+                    )
 
         return JobSpec(
             run_id=run_id,
@@ -290,6 +319,26 @@ class RunSupervisor:
             }
         )
 
+    # Cadence: under cloud's WARN window so quiet stretches reset the timer.
+    HEARTBEAT_INTERVAL_SECONDS = 30
+
+    async def _heartbeat_loop(self, run_id: str) -> None:
+        """Tick `run.heartbeat` at HEARTBEAT_INTERVAL while CC is active."""
+        try:
+            while True:
+                await asyncio.sleep(self.HEARTBEAT_INTERVAL_SECONDS)
+                await self._send(
+                    {
+                        "type": "run.heartbeat",
+                        "run_id": run_id,
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+        except asyncio.CancelledError:
+            return
+        except Exception:  # pragma: no cover
+            log.exception("heartbeat loop crashed run=%s", run_id)
+
     async def _send_terminal(
         self,
         run_id: str,
@@ -317,3 +366,103 @@ class RunSupervisor:
         if files_modified:
             frame["files_modified"] = files_modified
         await self._send(frame)
+        self._persist_terminal(
+            run_id,
+            kind=kind,
+            error=error,
+            external_session_id=external_session_id,
+            files_modified=files_modified or [],
+        )
+
+    # --- local persistence -------------------------------------------------
+
+    def _persist_dispatch(
+        self,
+        run_id: str,
+        frame: dict[str, Any],
+        agent: dict[str, Any],
+    ) -> None:
+        if self._state is None:
+            return
+        try:
+            now = time.time()
+            self._state.upsert_run(
+                RunRecord(
+                    run_id=run_id,
+                    agent_id=agent.get("id"),
+                    agent_slug=agent.get("slug"),
+                    agent_name=agent.get("name"),
+                    department_slug=frame.get("department_slug"),
+                    workspace_slug=frame.get("workspace_slug"),
+                    status="running",
+                    started_at=now,
+                    completed_at=None,
+                    last_event_at=now,
+                    step_count=0,
+                    error=None,
+                    external_session_id=None,
+                    files_modified=[],
+                )
+            )
+        except Exception:  # pragma: no cover
+            log.exception("persist dispatch failed run=%s", run_id)
+
+    def _persist_event(self, run_id: str, ev: StepEvent) -> None:
+        if self._state is None:
+            return
+        # Bumps the step count on substantive lifecycle frames so the TUI
+        # post-restart can show non-zero progress.
+        bump = ev.type in (
+            "step",
+            "thinking",
+            "tool_call",
+            "tool_result",
+            "assistant_message",
+        )
+        try:
+            self._state.update_run_status(
+                run_id,
+                last_event_at=time.time(),
+                bump_step=bump,
+            )
+        except Exception:  # pragma: no cover
+            pass
+
+    def _persist_terminal(
+        self,
+        run_id: str,
+        *,
+        kind: str,
+        error: str | None,
+        external_session_id: str | None,
+        files_modified: list[str],
+    ) -> None:
+        if self._state is None:
+            return
+        status_map = {
+            "completed": "completed",
+            "failed": "failed",
+            "awaiting_approval": "awaiting_approval",
+        }
+        status = status_map.get(kind, kind)
+        try:
+            self._state.update_run_status(
+                run_id,
+                status=status,
+                completed_at=time.time(),
+                error=error,
+                external_session_id=external_session_id,
+                files_modified=files_modified,
+            )
+            # Refresh the agent's session-id cache so the next run can
+            # `--resume` even if the cloud frame loses it.
+            if external_session_id:
+                rec = self._state.get_run(run_id)
+                if rec and rec.agent_id:
+                    self._state.update_agent_session(
+                        agent_id=rec.agent_id,
+                        session_id=external_session_id,
+                        run_id=run_id,
+                    )
+        except Exception:  # pragma: no cover
+            log.exception("persist terminal failed run=%s", run_id)
