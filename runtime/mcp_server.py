@@ -87,8 +87,13 @@ def build_server(*, run_id: str, creds: Credentials) -> Server:
             "tool": name,
             "arguments": arguments or {},
         }
+        # `delegate_to_agent` blocks until the child run finishes; chains
+        # of delegates can comfortably exceed the old 120 s ceiling. Use a
+        # split timeout (short connect, long read) instead of a flat one
+        # so we still surface DNS/TLS/connect outages quickly.
+        timeout = httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0)
         try:
-            async with httpx.AsyncClient(timeout=120) as client:
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(
                     f"{base_url}/devices/me/tools/call",
                     json=body,
@@ -96,10 +101,14 @@ def build_server(*, run_id: str, creds: Credentials) -> Server:
                 )
         except Exception as exc:
             log.exception("tool transport failed: %s", name)
+            # `str(exc)` is empty for some httpx exceptions (e.g.
+            # ReadTimeout); use repr() so the agent at least sees the
+            # exception type even when there's no message.
+            detail = str(exc) or repr(exc)
             return [
                 TextContent(
                     type="text",
-                    text=f"transport error calling {name}: {exc}",
+                    text=f"transport error calling {name}: {detail}",
                 )
             ]
 
