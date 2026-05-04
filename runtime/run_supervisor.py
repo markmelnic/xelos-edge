@@ -38,18 +38,28 @@ class RunSupervisor:
         self._sem = asyncio.Semaphore(max_concurrent_runs)
         self._active: dict[str, ClaudeCodeProcess] = {}
         self._lock = asyncio.Lock()
+        self._pending_cancel: set[str] = set()
+        # Strong refs prevent GC of in-flight _drive_run tasks.
+        self._drive_tasks: set[asyncio.Task] = set()
 
     async def start(self, frame: dict[str, Any]) -> None:
         run_id = str(frame.get("run_id") or "")
         if not run_id:
             log.warning("job.start frame missing run_id")
             return
-        asyncio.create_task(self._drive_run(run_id, frame))
+        task = asyncio.create_task(self._drive_run(run_id, frame))
+        self._drive_tasks.add(task)
+        task.add_done_callback(self._drive_tasks.discard)
 
     async def cancel(self, frame: dict[str, Any]) -> None:
         run_id = str(frame.get("run_id") or "")
-        proc = self._active.get(run_id)
+        async with self._lock:
+            proc = self._active.get(run_id)
         if proc is None:
+            # Run hasn't started CC yet (waiting on semaphore). Pre-cancel so
+            # _drive_run aborts immediately after acquiring the slot instead of
+            # starting a CC subprocess for a job the cloud already cancelled.
+            self._pending_cancel.add(run_id)
             return
         try:
             await proc.cancel()
@@ -67,6 +77,16 @@ class RunSupervisor:
 
     async def _drive_run(self, run_id: str, frame: dict[str, Any]) -> None:
         async with self._sem:
+            # A job.cancel frame may have arrived while we were queued behind
+            # the semaphore. Abort early so we don't spin up CC for a dead job.
+            if run_id in self._pending_cancel:
+                self._pending_cancel.discard(run_id)
+                log.info("run %s pre-cancelled before start; skipping CC", run_id)
+                await self._send_terminal(
+                    run_id, kind="failed", error="cancelled_before_start"
+                )
+                return
+
             spec = self._build_spec(run_id, frame)
             if spec is None:
                 await self._send_terminal(
@@ -248,6 +268,15 @@ class RunSupervisor:
                         resume_session_id,
                     )
 
+        # Bash-enabled agents run in an automated daemon context — there is no
+        # human to click "approve" on each command. Skip CC's interactive
+        # approval prompts so git, node, npm, multi-operation commands, etc.
+        # execute without error. The cc_bash_allowed gate on the API side is
+        # still the user-consent boundary.
+        extra_args: list[str] = []
+        if "Bash" in cc_allowed:
+            extra_args.append("--dangerously-skip-permissions")
+
         return JobSpec(
             run_id=run_id,
             working_directory=cwd,
@@ -257,6 +286,7 @@ class RunSupervisor:
             max_turns=max_turns,
             mcp_config_path=mcp_config_path,
             resume_session_id=resume_session_id,
+            extra_args=extra_args,
         )
 
     def _write_mcp_config(self, run_id: str) -> Path | None:

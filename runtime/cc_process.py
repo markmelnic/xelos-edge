@@ -185,7 +185,10 @@ class ClaudeCodeProcess:
                 self._proc.kill()
             except ProcessLookupError:
                 return
-            await self._proc.wait()
+            try:
+                await asyncio.wait_for(self._proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                log.error("process %s did not exit after SIGKILL", self._proc.pid)
 
     async def _drain_stderr(self) -> None:
         if self._proc is None or self._proc.stderr is None:
