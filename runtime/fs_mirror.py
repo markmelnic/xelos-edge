@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -169,10 +170,7 @@ class FsMirror:
             rel_path=rel_path,
         )
         if target.is_dir():
-            try:
-                target.rmdir()
-            except OSError:
-                log.warning("dir %s not empty — skipping rmdir", target)
+            shutil.rmtree(target, ignore_errors=True)
         elif target.exists():
             target.unlink()
         self.state.delete(str(target))

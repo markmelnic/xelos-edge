@@ -1191,7 +1191,7 @@ class XelosTUI(App):
             if sub in ("completed",):
                 self._metrics.runs_completed += 1
                 self._metrics.runs_active = max(0, self._metrics.runs_active - 1)
-            elif sub in ("failed",):
+            elif sub in ("failed", "cancelled", "awaiting_approval"):
                 self._metrics.runs_failed += 1
                 self._metrics.runs_active = max(0, self._metrics.runs_active - 1)
             self.query_one(RunsPane).upsert_run(

@@ -34,6 +34,9 @@ class JobSpec:
     # When set, shells out with `claude --resume <id>` so the prior
     # session's history rehydrates instead of starting cold.
     resume_session_id: str | None = None
+    # GitHub PAT — injected as GITHUB_TOKEN/GH_TOKEN env vars so
+    # `gh pr create` and `git push` HTTPS work without user interaction.
+    github_token: str | None = None
 
 
 class ClaudeNotFound(Exception):
@@ -104,16 +107,39 @@ class ClaudeCodeProcess:
         cwd = str(self.spec.working_directory)
         os.makedirs(cwd, exist_ok=True)
 
+        # Build subprocess environment. When a GitHub PAT is configured,
+        # inject it so `gh` CLI and git HTTPS operations work without prompts.
+        proc_env = os.environ.copy()
+        if self.spec.github_token:
+            token = self.spec.github_token
+            proc_env["GITHUB_TOKEN"] = token
+            proc_env["GH_TOKEN"] = token
+            proc_env["GIT_TERMINAL_PROMPT"] = "0"
+            # GIT_ASKPASS helper: reads GITHUB_TOKEN from env at call time so
+            # the PAT is never written to disk. Created once; content is fixed.
+            askpass = Path.home() / ".xelos" / "bin" / "git-github-askpass"
+            askpass.parent.mkdir(parents=True, exist_ok=True)
+            askpass.write_text(
+                "#!/bin/sh\n"
+                'case "$1" in\n'
+                '  *[Uu]sername*) printf "x-access-token" ;;\n'
+                '  *[Pp]assword*) printf "%s" "$GITHUB_TOKEN" ;;\n'
+                "esac\n"
+            )
+            askpass.chmod(0o700)
+            proc_env["GIT_ASKPASS"] = str(askpass)
+
         # Log message length only; full content lives in the cloud trigger_payload.
         log.info(
             "spawning claude code: cwd=%s tools=%s max_turns=%d "
-            "user_msg_chars=%d sys_prompt_chars=%d mcp=%s",
+            "user_msg_chars=%d sys_prompt_chars=%d mcp=%s github=%s",
             cwd,
             self.spec.allowed_tools,
             self.spec.max_turns,
             len(user_msg),
             len(sys_prompt),
             self.spec.mcp_config_path,
+            bool(self.spec.github_token),
         )
         # System prompt collapsed to its length to keep the argv line short.
         redacted = [
@@ -132,6 +158,7 @@ class ClaudeCodeProcess:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=proc_env,
         )
 
         # Write the prompt to stdin and close it before reading stdout.
@@ -185,7 +212,10 @@ class ClaudeCodeProcess:
                 self._proc.kill()
             except ProcessLookupError:
                 return
-            await self._proc.wait()
+            try:
+                await asyncio.wait_for(self._proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                log.error("process %s did not exit after SIGKILL", self._proc.pid)
 
     async def _drain_stderr(self) -> None:
         if self._proc is None or self._proc.stderr is None:

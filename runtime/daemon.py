@@ -27,7 +27,7 @@ from .capabilities import detect as detect_capabilities
 from .config import Credentials
 from .events import EVENTS
 from .fingerprint import short_host
-from .fs_mirror import FsMirror
+from .fs_mirror import FsMirror, _resolve_target
 from .hydrate import fetch_manifest
 from .path_resolver import resolve as resolve_path
 from .reconcile import reconcile_with_cloud
@@ -75,6 +75,8 @@ class Daemon:
         self._hydrate_lock = asyncio.Lock()
         self._hydrated_once = False
         self._known_workspaces: list[dict[str, Any]] = []
+        # Strong refs prevent GC of in-flight background tasks.
+        self._background_tasks: set[asyncio.Task] = set()
 
     async def run(self) -> None:
         if self.options.install_signal_handlers:
@@ -210,8 +212,9 @@ class Daemon:
             log.debug("recv %s", ftype)
 
         if ftype == "ready":
-            # Reconcile runs on every connect; kick off in the background.
-            asyncio.create_task(self._on_ready())
+            task = asyncio.create_task(self._on_ready())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
             return
         if ftype in ("hello_ack", "heartbeat_ack", "ignored"):
             return
@@ -326,8 +329,6 @@ class Daemon:
         Layout is `~/.xelos/mirror/<workspace_slug>/...`. Walks every active
         mirror and returns whichever one contains `abs_path`.
         """
-        from pathlib import Path
-
         try:
             p = Path(abs_path).resolve()
         except OSError:
@@ -431,6 +432,20 @@ class Daemon:
             return
 
         try:
+            # Suppress before writing so the watcher thread can't see the
+            # file change between os.replace and suppress (TOCTOU window).
+            if self._watcher is not None:
+                try:
+                    abs_path = _resolve_target(
+                        workspace_slug=workspace_slug,
+                        scope=scope,
+                        department_slug=dept,
+                        agent_slug=agent,
+                        rel_path=rel,
+                    )
+                    self._watcher.suppress(str(abs_path))
+                except ValueError:
+                    pass
             outcome = mirror.write_file(
                 scope=scope,
                 department_slug=dept,
@@ -440,8 +455,6 @@ class Daemon:
                 content_hash=frame.get("content_hash"),
                 origin="cloud",
             )
-            if self._watcher is not None:
-                self._watcher.suppress(str(outcome.abs_path))
             log.info("fs.push applied: %s", rel)
             EVENTS.publish(
                 "fs.pulled",
@@ -551,9 +564,7 @@ class Daemon:
             return
         # mirror.root → `~/.xelos/mirror/<workspace_slug>`; one level up is
         # the multi-workspace root.
-        from pathlib import Path
-
-        watcher_root = Path(mirror.root).parent
+        watcher_root = mirror.root.parent
         watcher = FsWatcher(root=watcher_root, on_event=self._on_local_change)
         await watcher.start()
         self._watcher = watcher
@@ -769,8 +780,6 @@ class Daemon:
         if not isinstance(rel, str):
             return
         try:
-            from .fs_mirror import _resolve_target
-
             target = _resolve_target(
                 workspace_slug=mirror.workspace_slug,
                 scope=frame["scope"],
